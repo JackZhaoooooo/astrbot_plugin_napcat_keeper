@@ -331,18 +331,25 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_send_notification_to_umos_skips_qq_official_session_proactively(self):
+    async def test_send_notification_to_umos_attempts_qq_official_and_detects_success_by_outbound_anchor(
+        self,
+    ):
+        platform = DummyPlatform(
+            id="default",
+            name="qq_official",
+            description="QQ 机器人官方 API 适配器",
+        )
+        platform._session_last_inbound_message_id = {"session-1": "inbound-1"}
+        platform._session_last_outbound_message_id = {}
+
+        async def send_message_side_effect(umo, _message_chain):
+            if umo == "default:FriendMessage:session-1":
+                platform._session_last_outbound_message_id["session-1"] = "outbound-1"
+            return True
+
         context = types.SimpleNamespace(
-            send_message=AsyncMock(return_value=True),
-            platform_manager=types.SimpleNamespace(
-                platform_insts=[
-                    DummyPlatform(
-                        id="default",
-                        name="qq_official",
-                        description="QQ 机器人官方 API 适配器",
-                    )
-                ]
-            ),
+            send_message=AsyncMock(side_effect=send_message_side_effect),
+            platform_manager=types.SimpleNamespace(platform_insts=[platform]),
         )
         plugin = self.make_plugin(context=context)
         captured = []
@@ -350,34 +357,29 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
             (level, message)
         )
 
-        await plugin._send_notification_to_umos(
-            ["default:FriendMessage:session-1"],
-            "test message",
-            "重新登录通知",
-        )
-        await plugin._send_notification_to_umos(
+        delivered = await plugin._send_notification_to_umos(
             ["default:FriendMessage:session-1"],
             "test message",
             "重新登录通知",
         )
 
-        self.assertEqual(context.send_message.await_count, 0)
+        self.assertTrue(delivered)
+        self.assertEqual(context.send_message.await_count, 1)
         self.assertTrue(
             any(
-                level == "WARNING"
-                and "QQ 官方平台会话依赖最近一条有效消息的 msg_id" in message
+                level == "INFO" and "开始尝试发送" in message
                 for level, message in captured
             )
         )
         self.assertTrue(
             any(
-                level == "DEBUG"
-                and "已标记为不可主动通知" in message
+                level == "INFO"
+                and "QQ 官方平台已生成新的出站消息锚点" in message
                 for level, message in captured
             )
         )
 
-    async def test_send_notification_to_umos_disables_umo_after_invalid_msg_id_error(self):
+    async def test_send_notification_to_umos_retries_after_invalid_msg_id_error(self):
         context = types.SimpleNamespace(
             send_message=AsyncMock(side_effect=RuntimeError("请求参数msg_id无效或越权"))
         )
@@ -387,32 +389,29 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
             (level, message)
         )
 
-        await plugin._send_notification_to_umos(
+        first = await plugin._send_notification_to_umos(
             ["default:FriendMessage:session-2"],
             "test message",
             "退出登录通知",
         )
-        await plugin._send_notification_to_umos(
+        second = await plugin._send_notification_to_umos(
             ["default:FriendMessage:session-2"],
             "test message",
             "退出登录通知",
         )
 
-        self.assertEqual(context.send_message.await_count, 1)
+        self.assertFalse(first)
+        self.assertFalse(second)
+        self.assertEqual(context.send_message.await_count, 2)
         self.assertTrue(
             any(
                 level == "WARNING"
                 and "msg_id 已失效或无权限" in message
+                and "将继续尝试后续通知目标" in message
                 for level, message in captured
             )
         )
-        self.assertTrue(
-            any(
-                level == "DEBUG"
-                and "已标记为不可主动通知" in message
-                for level, message in captured
-            )
-        )
+        self.assertFalse(any("已标记为不可主动通知" in message for _level, message in captured))
 
     async def test_send_notification_to_webhooks_posts_json_payload(self):
         plugin = self.make_plugin(
@@ -535,7 +534,7 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
                 "logout_notify_webhooks": ["https://example.com/logout-hook"],
             }
         )
-        plugin._send_notification_to_umos = AsyncMock()
+        plugin._send_notification_to_umos = AsyncMock(return_value=False)
         plugin._send_notification_to_webhooks = AsyncMock()
         plugin._log = lambda *args, **kwargs: None
 
@@ -569,6 +568,48 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["account"]["user_id"], "123456789")
         self.assertEqual(payload["status"]["current_overall_status"], "offline")
         self.assertIn("NapCat Keeper 检测到 QQ 已退出登录", payload["message"])
+
+    async def test_handle_login_transition_notifications_skips_webhook_when_umo_succeeds(self):
+        plugin = self.make_plugin(
+            {
+                "relogin_notify_webhooks": ["https://example.com/relogin-hook"],
+            }
+        )
+        plugin._send_notification_to_umos = AsyncMock(return_value=True)
+        plugin._send_notification_to_webhooks = AsyncMock()
+        captured = []
+        plugin._log = lambda message, level="INFO", **kwargs: captured.append(
+            (level, message)
+        )
+
+        previous_snapshot = self.make_snapshot(
+            "offline",
+            login_state="not_logged_in",
+            login_detail="WebUI 检测到当前未登录 QQ。",
+        )
+        current_snapshot = self.make_snapshot(
+            "online",
+            login_state="logged_in",
+            login_detail="WebUI 检测到 QQ 已登录: NapCatBot (123456789)。",
+            user_id="123456789",
+            nickname="NapCatBot",
+        )
+
+        await plugin._handle_login_transition_notifications(
+            previous_snapshot,
+            current_snapshot,
+            "2026-03-24 22:31:00",
+        )
+
+        self.assertEqual(plugin._send_notification_to_umos.await_count, 1)
+        self.assertEqual(plugin._send_notification_to_webhooks.await_count, 0)
+        self.assertTrue(
+            any(
+                level == "DEBUG"
+                and "重新登录通知已通过 UMO 发送成功，跳过 Webhook 兜底。" in message
+                for level, message in captured
+            )
+        )
 
     async def test_handle_login_transition_notifications_skips_first_snapshot(self):
         context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))

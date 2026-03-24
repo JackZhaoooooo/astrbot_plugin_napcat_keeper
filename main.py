@@ -160,8 +160,6 @@ class NapcatKeeperPlugin(Star):
         self._last_snapshot = None
         self._webui_credential = None
         self._webui_credential_cached_at = 0.0
-        self._notification_blocked_umos: dict[str, str] = {}
-
         self._log("=" * 50)
         self._log("NapcatKeeper 插件初始化")
         self._log(f"NapCat URL: {self.napcat_url}")
@@ -789,15 +787,27 @@ class NapcatKeeperPlugin(Star):
             return f"{login.nickname or '未知昵称'} ({login.user_id})"
         return "未识别到登录账号"
 
-    def _resolve_platform_meta_for_umo(self, umo: str) -> Any | None:
-        platform_id = str(umo or "").split(":", 1)[0].strip()
+    @staticmethod
+    def _split_umo(umo: str) -> tuple[str | None, str | None, str | None]:
+        parts = str(umo or "").split(":", 2)
+        if len(parts) != 3:
+            return None, None, None
+        platform_id, message_type, session_id = (part.strip() for part in parts)
+        return (
+            platform_id or None,
+            message_type or None,
+            session_id or None,
+        )
+
+    def _resolve_platform_for_umo(self, umo: str) -> tuple[Any | None, Any | None]:
+        platform_id, _message_type, _session_id = self._split_umo(umo)
         if not platform_id:
-            return None
+            return None, None
 
         platform_manager = getattr(self.context, "platform_manager", None)
         platform_insts = getattr(platform_manager, "platform_insts", None)
         if not platform_insts:
-            return None
+            return None, None
 
         for platform in platform_insts:
             meta_getter = getattr(platform, "meta", None)
@@ -808,23 +818,54 @@ class NapcatKeeperPlugin(Star):
             except Exception:
                 continue
             if getattr(meta, "id", None) == platform_id:
-                return meta
-        return None
+                return platform, meta
+        return None, None
 
-    def _get_notification_block_reason_for_umo(self, umo: str) -> str | None:
-        meta = self._resolve_platform_meta_for_umo(umo)
+    @staticmethod
+    def _is_qq_official_platform(meta: Any | None) -> bool:
         if meta is None:
-            return None
-
+            return False
         platform_name = str(getattr(meta, "name", "") or "").strip().lower()
-        if platform_name in {"qq_official", "qq_official_webhook"}:
-            return (
-                "QQ 官方平台会话依赖最近一条有效消息的 msg_id，"
-                "AstrBot 当前无法通过该 UMO 主动发送通知。"
-                "请改用其他平台/群聊 UMO，或先在该会话中重新与机器人交互。"
-            )
+        return platform_name in {"qq_official", "qq_official_webhook"}
 
+    @staticmethod
+    def _read_platform_session_marker(
+        platform: Any | None,
+        session_id: str | None,
+        *attr_names: str,
+    ) -> str | None:
+        if platform is None or not session_id:
+            return None
+        for attr_name in attr_names:
+            mapping = getattr(platform, attr_name, None)
+            if not isinstance(mapping, dict):
+                continue
+            value = mapping.get(session_id)
+            if value not in (None, ""):
+                text = str(value).strip()
+                if text:
+                    return text
         return None
+
+    def _build_qq_official_send_failure_reason(
+        self,
+        *,
+        session_id: str | None,
+        inbound_marker: str | None,
+        outbound_before: str | None,
+        outbound_after: str | None,
+    ) -> str:
+        if not inbound_marker:
+            return (
+                "当前会话没有可用的入站 msg_id，QQ 官方平台无法完成主动发送。"
+                "请先在该会话中重新与机器人交互后再重试。"
+            )
+        if outbound_after and outbound_after != outbound_before:
+            return ""
+        return (
+            "已调用 QQ 官方平台发送链路，但未观察到新的出站消息锚点，"
+            "本次通知大概率未实际发出。"
+        )
 
     @staticmethod
     def _get_notification_block_reason_from_exception(error: Exception) -> str | None:
@@ -918,57 +959,98 @@ class NapcatKeeperPlugin(Star):
         targets: list[str],
         message: str,
         label: str,
-    ):
+    ) -> bool:
         if not targets:
             self._log(f"检测到{label}事件，但未配置通知 UMO，跳过发送。", "DEBUG")
-            return
+            return False
+
+        any_success = False
 
         for umo in targets:
-            blocked_reason = self._notification_blocked_umos.get(umo)
-            if blocked_reason:
-                self._log(
-                    f"{label}已跳过，当前 UMO 已标记为不可主动通知"
-                    f" | UMO: {umo} | 原因: {blocked_reason}",
-                    "DEBUG",
+            platform, meta = self._resolve_platform_for_umo(umo)
+            _platform_id, _message_type, session_id = self._split_umo(umo)
+            platform_name = str(getattr(meta, "name", "") or "unknown").strip() or "unknown"
+            is_qq_official = self._is_qq_official_platform(meta)
+            inbound_marker = self._read_platform_session_marker(
+                platform,
+                session_id,
+                "_session_last_inbound_message_id",
+                "_session_last_message_id",
+            )
+            outbound_before = self._read_platform_session_marker(
+                platform,
+                session_id,
+                "_session_last_outbound_message_id",
+            )
+            self._log(
+                f"{label}开始尝试发送 | UMO: {umo} | 平台: {platform_name}"
+                + (
+                    f" | 入站锚点: {'已存在' if inbound_marker else '缺失'}"
+                    if is_qq_official
+                    else ""
                 )
-                continue
-
-            blocked_reason = self._get_notification_block_reason_for_umo(umo)
-            if blocked_reason:
-                self._notification_blocked_umos[umo] = blocked_reason
-                self._log(
-                    f"{label}已跳过 | UMO: {umo} | 原因: {blocked_reason}",
-                    "WARNING",
-                )
-                continue
+            )
 
             try:
                 delivered = await self.context.send_message(
                     umo,
                     MessageChain().message(message),
                 )
-                if delivered:
-                    self._log(f"{label}已发送 | UMO: {umo}")
-                else:
+                if not delivered:
                     self._log(
-                        f"{label}发送失败，未找到对应会话 | UMO: {umo}",
+                        f"{label}发送失败，未找到对应会话 | UMO: {umo}"
+                        " | 将继续尝试后续通知目标。",
                         "WARNING",
                     )
+                    continue
+
+                if is_qq_official:
+                    outbound_after = self._read_platform_session_marker(
+                        platform,
+                        session_id,
+                        "_session_last_outbound_message_id",
+                    )
+                    if outbound_after and outbound_after != outbound_before:
+                        any_success = True
+                        self._log(
+                            f"{label}已发送 | UMO: {umo} | 平台: {platform_name}"
+                            " | QQ 官方平台已生成新的出站消息锚点。"
+                        )
+                    else:
+                        failure_reason = self._build_qq_official_send_failure_reason(
+                            session_id=session_id,
+                            inbound_marker=inbound_marker,
+                            outbound_before=outbound_before,
+                            outbound_after=outbound_after,
+                        )
+                        self._log(
+                            f"{label}发送未确认成功 | UMO: {umo} | 平台: {platform_name}"
+                            f" | 原因: {failure_reason}"
+                            " | 将继续尝试后续通知目标。",
+                            "WARNING",
+                        )
+                    continue
+
+                any_success = True
+                self._log(f"{label}已发送 | UMO: {umo}")
             except Exception as e:
-                blocked_reason = self._get_notification_block_reason_from_exception(e)
-                if blocked_reason:
-                    self._notification_blocked_umos[umo] = blocked_reason
+                failure_reason = self._get_notification_block_reason_from_exception(e)
+                if failure_reason:
                     self._log(
-                        f"{label}已跳过 | UMO: {umo} | 原因: {blocked_reason}",
+                        f"{label}发送失败 | UMO: {umo} | 原因: {failure_reason}"
+                        " | 将继续尝试后续通知目标。",
                         "WARNING",
                     )
                     continue
 
                 self._log(
-                    f"{label}发送异常 | UMO: {umo} | 错误: {e}",
+                    f"{label}发送异常 | UMO: {umo} | 错误: {e}"
+                    " | 将继续尝试后续通知目标。",
                     "ERROR",
                     exc_info=True,
                 )
+
+        return any_success
 
     async def _post_notification_webhook(
         self,
@@ -1061,16 +1143,23 @@ class NapcatKeeperPlugin(Star):
                 current_time,
                 message,
             )
-            await self._send_notification_to_umos(
+            delivered = await self._send_notification_to_umos(
                 self.logout_notify_umos,
                 message,
                 "退出登录通知",
             )
-            await self._send_notification_to_webhooks(
-                self.logout_notify_webhooks,
-                payload,
-                "退出登录通知",
-            )
+            if delivered:
+                self._log("退出登录通知已通过 UMO 发送成功，跳过 Webhook 兜底。", "DEBUG")
+            else:
+                self._log(
+                    "退出登录通知未通过 UMO 发送成功，开始尝试 Webhook 兜底。",
+                    "WARNING",
+                )
+                await self._send_notification_to_webhooks(
+                    self.logout_notify_webhooks,
+                    payload,
+                    "退出登录通知",
+                )
             return
 
         if previous_state in {"not_logged_in", "error"} and current_state == "logged_in":
@@ -1087,16 +1176,23 @@ class NapcatKeeperPlugin(Star):
                 current_time,
                 message,
             )
-            await self._send_notification_to_umos(
+            delivered = await self._send_notification_to_umos(
                 self.relogin_notify_umos,
                 message,
                 "重新登录通知",
             )
-            await self._send_notification_to_webhooks(
-                self.relogin_notify_webhooks,
-                payload,
-                "重新登录通知",
-            )
+            if delivered:
+                self._log("重新登录通知已通过 UMO 发送成功，跳过 Webhook 兜底。", "DEBUG")
+            else:
+                self._log(
+                    "重新登录通知未通过 UMO 发送成功，开始尝试 Webhook 兜底。",
+                    "WARNING",
+                )
+                await self._send_notification_to_webhooks(
+                    self.relogin_notify_webhooks,
+                    payload,
+                    "重新登录通知",
+                )
 
     async def _ensure_monitor_started(self, trigger: str) -> bool:
         """幂等地启动监控任务，兼容安装后热加载与常规启动。"""
