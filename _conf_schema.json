@@ -5,6 +5,12 @@
         "hint": "默认: http://localhost:6099",
         "default": "http://localhost:6099"
     },
+    "napcat_token": {
+        "description": "NapCat WebUI Token",
+        "type": "string",
+        "hint": "WebUI 登录密钥，留空则不验证",
+        "default": ""
+    },
     "check_interval": {
         "description": "状态检查间隔（秒）",
         "type": "int",
@@ -14,7 +20,7 @@
     "max_retries": {
         "description": "连续失败重试次数阈值",
         "type": "int",
-        "hint": "超过此次数后自动重启 NapCat",
+        "hint": "超过此次数后自动恢复 NapCat",
         "default": 3
     },
     "napcat_dir": {
@@ -30,15 +36,33 @@
         "default": "/root/AstrBot/napcat/launcher.sh"
     },
     "enable_auto_restart": {
-        "description": "启用自动重启功能",
+        "description": "启用自动恢复功能",
         "type": "bool",
-        "hint": "关闭后仅监控不自动重启",
+        "hint": "关闭后仅监控不自动恢复",
         "default": true
     },
-    "notify_on_restart": {
-        "description": "重启后发送通知",
+    "enable_auto_login": {
+        "description": "掉线后自动重新登录",
         "type": "bool",
-        "hint": "自动重启后通知管理员",
+        "hint": "需要配置下方的 QQ 账号密码",
+        "default": true
+    },
+    "qq_account": {
+        "description": "QQ 账号（用于自动登录）",
+        "type": "string",
+        "hint": "填写机器人 QQ 号",
+        "default": ""
+    },
+    "qq_password": {
+        "description": "QQ 密码（用于自动登录）",
+        "type": "string",
+        "hint": "留空则使用快速登录（需要先登录成功一次）",
+        "default": ""
+    },
+    "notify_on_restart": {
+        "description": "恢复后发送通知",
+        "type": "bool",
+        "hint": "自动恢复后通知管理员",
         "default": true
     }
 }
