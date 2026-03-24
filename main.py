@@ -132,6 +132,24 @@ class NapcatKeeperPlugin(Star):
         self.relogin_notify_umos = self._normalize_umo_list(
             config.get("relogin_notify_umos", [])
         )
+        (
+            self.logout_notify_webhooks,
+            invalid_logout_notify_webhooks,
+        ) = self._normalize_webhook_targets(
+            config.get("logout_notify_webhooks", [])
+        )
+        (
+            self.relogin_notify_webhooks,
+            invalid_relogin_notify_webhooks,
+        ) = self._normalize_webhook_targets(
+            config.get("relogin_notify_webhooks", [])
+        )
+        self.notification_webhook_timeout_seconds = (
+            self._parse_positive_int(
+                config.get("notification_webhook_timeout_seconds", 5),
+                default=5,
+            )
+        )
 
         self._consecutive_failures = 0
         self._is_monitoring = False
@@ -161,8 +179,30 @@ class NapcatKeeperPlugin(Star):
             if self.relogin_notify_umos
             else "重新登录通知: 未配置"
         )
+        logout_webhook_text = (
+            f"退出登录 Webhook: {len(self.logout_notify_webhooks)} 个"
+            if self.logout_notify_webhooks
+            else "退出登录 Webhook: 未配置"
+        )
+        relogin_webhook_text = (
+            f"重新登录 Webhook: {len(self.relogin_notify_webhooks)} 个"
+            if self.relogin_notify_webhooks
+            else "重新登录 Webhook: 未配置"
+        )
         self._log(logout_notify_text)
         self._log(relogin_notify_text)
+        self._log(logout_webhook_text)
+        self._log(relogin_webhook_text)
+        for invalid_webhook in invalid_logout_notify_webhooks:
+            self._log(
+                f"忽略无效的退出登录 Webhook 地址: {invalid_webhook}",
+                "WARNING",
+            )
+        for invalid_webhook in invalid_relogin_notify_webhooks:
+            self._log(
+                f"忽略无效的重新登录 Webhook 地址: {invalid_webhook}",
+                "WARNING",
+            )
         self._log("=" * 50)
 
     def _log(self, msg: str, level: str = "INFO", *, exc_info=False):
@@ -223,7 +263,7 @@ class NapcatKeeperPlugin(Star):
         return user_id or None
 
     @staticmethod
-    def _normalize_umo_list(raw_value: Any) -> list[str]:
+    def _normalize_string_list(raw_value: Any) -> list[str]:
         if raw_value in (None, ""):
             return []
 
@@ -242,6 +282,36 @@ class NapcatKeeperPlugin(Star):
                     normalized.append(umo)
 
         return normalized
+
+    @classmethod
+    def _normalize_umo_list(cls, raw_value: Any) -> list[str]:
+        return cls._normalize_string_list(raw_value)
+
+    @staticmethod
+    def _looks_like_http_url(value: str | None) -> bool:
+        if not value:
+            return False
+        parsed = urlsplit(str(value).strip())
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    @classmethod
+    def _normalize_webhook_targets(cls, raw_value: Any) -> tuple[list[str], list[str]]:
+        valid: list[str] = []
+        invalid: list[str] = []
+        for item in cls._normalize_string_list(raw_value):
+            if cls._looks_like_http_url(item):
+                valid.append(item)
+            else:
+                invalid.append(item)
+        return valid, invalid
+
+    @staticmethod
+    def _parse_positive_int(raw_value: Any, *, default: int) -> int:
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
 
     @staticmethod
     def _auto_login_requires_manual_action(detail: str | None) -> bool:
@@ -810,6 +880,39 @@ class NapcatKeeperPlugin(Star):
             f"说明: {detail}"
         )
 
+    def _build_transition_notification_payload(
+        self,
+        kind: str,
+        previous_snapshot: StatusSnapshot,
+        current_snapshot: StatusSnapshot,
+        current_time: str,
+        message: str,
+    ) -> dict[str, Any]:
+        if kind == "logout":
+            identity_source = current_snapshot.login
+            if not identity_source or not identity_source.user_id:
+                identity_source = previous_snapshot.login
+        else:
+            identity_source = current_snapshot.login or previous_snapshot.login
+
+        return {
+            "plugin": "NapcatKeeper",
+            "event": kind,
+            "time": current_time,
+            "napcat_url": self.napcat_url,
+            "account": {
+                "user_id": identity_source.user_id if identity_source else None,
+                "nickname": identity_source.nickname if identity_source else None,
+                "display": self._format_account_identity(identity_source),
+            },
+            "status": {
+                "previous_login_state": self._notification_login_state(previous_snapshot),
+                "current_login_state": self._notification_login_state(current_snapshot),
+                "current_overall_status": current_snapshot.overall_status,
+            },
+            "message": message,
+        }
+
     async def _send_notification_to_umos(
         self,
         targets: list[str],
@@ -867,6 +970,71 @@ class NapcatKeeperPlugin(Star):
                     exc_info=True,
                 )
 
+    async def _post_notification_webhook(
+        self,
+        session: aiohttp.ClientSession,
+        webhook_url: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, str | None]:
+        async with session.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(
+                total=self.notification_webhook_timeout_seconds
+            ),
+        ) as resp:
+            raw_text = None
+            if not 200 <= resp.status < 300:
+                raw_text = self._summarize_response_text(await resp.text())
+            return resp.status, raw_text
+
+    async def _send_notification_to_webhooks(
+        self,
+        targets: list[str],
+        payload: dict[str, Any],
+        label: str,
+    ):
+        if not targets:
+            self._log(f"检测到{label}事件，但未配置 Webhook，跳过发送。", "DEBUG")
+            return
+
+        async with aiohttp.ClientSession() as session:
+            for webhook_url in targets:
+                try:
+                    status_code, raw_text = await self._post_notification_webhook(
+                        session,
+                        webhook_url,
+                        payload,
+                    )
+                    if 200 <= status_code < 300:
+                        self._log(
+                            f"{label} Webhook 已发送 | 地址: {webhook_url} | 响应: HTTP {status_code}"
+                        )
+                    else:
+                        detail = raw_text or f"HTTP {status_code}"
+                        self._log(
+                            f"{label} Webhook 发送失败 | 地址: {webhook_url} | 响应: {detail}",
+                            "WARNING",
+                        )
+                except asyncio.TimeoutError:
+                    self._log(
+                        f"{label} Webhook 请求超时 | 地址: {webhook_url} "
+                        f"| 超时: {self.notification_webhook_timeout_seconds} 秒",
+                        "WARNING",
+                    )
+                except aiohttp.ClientError as e:
+                    self._log(
+                        f"{label} Webhook 请求失败 | 地址: {webhook_url} | 错误: {e}",
+                        "WARNING",
+                    )
+                except Exception as e:
+                    self._log(
+                        f"{label} Webhook 发送异常 | 地址: {webhook_url} | 错误: {e}",
+                        "ERROR",
+                        exc_info=True,
+                    )
+
     async def _handle_login_transition_notifications(
         self,
         previous_snapshot: StatusSnapshot | None,
@@ -886,9 +1054,21 @@ class NapcatKeeperPlugin(Star):
                 current_snapshot,
                 current_time,
             )
+            payload = self._build_transition_notification_payload(
+                "logout",
+                previous_snapshot,
+                current_snapshot,
+                current_time,
+                message,
+            )
             await self._send_notification_to_umos(
                 self.logout_notify_umos,
                 message,
+                "退出登录通知",
+            )
+            await self._send_notification_to_webhooks(
+                self.logout_notify_webhooks,
+                payload,
                 "退出登录通知",
             )
             return
@@ -900,9 +1080,21 @@ class NapcatKeeperPlugin(Star):
                 current_snapshot,
                 current_time,
             )
+            payload = self._build_transition_notification_payload(
+                "relogin",
+                previous_snapshot,
+                current_snapshot,
+                current_time,
+                message,
+            )
             await self._send_notification_to_umos(
                 self.relogin_notify_umos,
                 message,
+                "重新登录通知",
+            )
+            await self._send_notification_to_webhooks(
+                self.relogin_notify_webhooks,
+                payload,
                 "重新登录通知",
             )
 

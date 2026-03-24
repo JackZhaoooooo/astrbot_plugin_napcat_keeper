@@ -68,6 +68,15 @@
         },
         "default": []
     },
+    "logout_notify_webhooks": {
+        "description": "退出登录 Webhook",
+        "type": "list",
+        "hint": "填写一个或多个 HTTP/HTTPS Webhook 地址，会在 QQ 退出登录时以 JSON POST 通知",
+        "items": {
+            "type": "string"
+        },
+        "default": []
+    },
     "relogin_notify_umos": {
         "description": "重新登录通知",
         "type": "list",
@@ -76,6 +85,21 @@
             "type": "string"
         },
         "default": []
+    },
+    "relogin_notify_webhooks": {
+        "description": "重新登录 Webhook",
+        "type": "list",
+        "hint": "填写一个或多个 HTTP/HTTPS Webhook 地址，会在 QQ 重新登录时以 JSON POST 通知",
+        "items": {
+            "type": "string"
+        },
+        "default": []
+    },
+    "notification_webhook_timeout_seconds": {
+        "description": "通知 Webhook 超时（秒）",
+        "type": "int",
+        "hint": "默认 5 秒，建议设置 3-10 秒",
+        "default": 5
     },
     "notify_on_restart": {
         "description": "恢复后发送通知",
