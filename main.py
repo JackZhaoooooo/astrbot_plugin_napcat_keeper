@@ -24,6 +24,11 @@ LOG_FILE = "/root/AstrBot/logs/napcat_keeper.log"
 FILE_LOGGER_NAME = "astrbot_plugin_napcat_keeper.file"
 SUCCESS_HTTP_CODES = {200, 301, 302, 303, 307, 308}
 WEBUI_SUCCESS_CODES = {0, "0"}
+RECOVERY_SERVICE_READY_TIMEOUT_SECONDS = 15
+RECOVERY_SERVICE_READY_POLL_SECONDS = 1
+RECOVERY_VERIFY_INTERVAL_SECONDS = 2
+RECOVERY_VERIFY_ATTEMPTS_WITH_AUTO_LOGIN = 8
+RECOVERY_VERIFY_ATTEMPTS_DEFAULT = 4
 STATUS_TEXT = {
     "online": "🟢 在线",
     "offline": "🟡 未登录",
@@ -59,6 +64,13 @@ class StatusSnapshot:
     overall_status: str
     service: ServiceCheckResult
     login: LoginCheckResult | None
+
+
+@dataclass(frozen=True)
+class AutoLoginAttemptResult:
+    submitted: bool
+    detail: str
+    level: str = "INFO"
 
 
 def _build_file_logger() -> logging.Logger:
@@ -785,14 +797,18 @@ class NapcatKeeperPlugin(Star):
 
             await asyncio.sleep(self.check_interval)
 
-    async def _check_napcat_service_status(self) -> ServiceCheckResult:
+    async def _check_napcat_service_status(
+        self,
+        *,
+        timeout_seconds: int = 5,
+    ) -> ServiceCheckResult:
         """检查 NapCat WebUI/服务端口是否可达。"""
         checked_url = self.napcat_url
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     checked_url,
-                    timeout=aiohttp.ClientTimeout(total=5),
+                    timeout=aiohttp.ClientTimeout(total=timeout_seconds),
                 ) as resp:
                     if resp.status in SUCCESS_HTTP_CODES:
                         return self._build_service_result(
@@ -808,7 +824,7 @@ class NapcatKeeperPlugin(Star):
         except asyncio.TimeoutError:
             return self._build_service_result(
                 checked_url,
-                detail="连接超时（5 秒内未收到响应）。",
+                detail=f"连接超时（{timeout_seconds} 秒内未收到响应）。",
             )
         except aiohttp.ClientError as e:
             return self._build_service_result(
@@ -1166,16 +1182,24 @@ class NapcatKeeperPlugin(Star):
             f"已为 QQ {account} 提交密码登录请求。 | 接口: {endpoint}",
         )
 
-    async def _auto_login_qq(self) -> bool:
+    async def _auto_login_qq(self) -> AutoLoginAttemptResult:
         account = str(self.qq_account or "").strip()
         password = str(self.qq_password or "").strip()
         if not self.enable_auto_login:
-            self._log("已禁用 QQ 自动登录，跳过自动登录流程。")
-            return False
+            result = AutoLoginAttemptResult(
+                submitted=False,
+                detail="已禁用 QQ 自动登录，跳过自动登录流程。",
+            )
+            self._log(result.detail, result.level)
+            return result
 
         if not account:
-            self._log("未配置 qq_account，跳过 QQ 自动登录。")
-            return False
+            result = AutoLoginAttemptResult(
+                submitted=False,
+                detail="未配置 qq_account，跳过 QQ 自动登录。",
+            )
+            self._log(result.detail, result.level)
+            return result
 
         login_mode = "密码登录" if password else "快速登录"
         self._log(f"准备执行 QQ 自动登录 | 账号: {account} | 方式: {login_mode}")
@@ -1198,20 +1222,110 @@ class NapcatKeeperPlugin(Star):
                         account,
                     )
         except (ValueError, RuntimeError) as e:
-            self._log(str(e), "ERROR")
-            return False
+            result = AutoLoginAttemptResult(
+                submitted=False,
+                detail=str(e),
+                level="ERROR",
+            )
+            self._log(result.detail, result.level)
+            return result
         except asyncio.TimeoutError:
-            self._log("QQ 自动登录超时（5 秒内未收到响应）。", "ERROR")
-            return False
+            result = AutoLoginAttemptResult(
+                submitted=False,
+                detail="QQ 自动登录超时（5 秒内未收到响应）。",
+                level="ERROR",
+            )
+            self._log(result.detail, result.level)
+            return result
         except aiohttp.ClientError as e:
-            self._log(f"QQ 自动登录请求失败: {e}", "ERROR")
-            return False
+            result = AutoLoginAttemptResult(
+                submitted=False,
+                detail=f"QQ 自动登录请求失败: {e}",
+                level="ERROR",
+            )
+            self._log(result.detail, result.level)
+            return result
         except Exception as e:
-            self._log(f"QQ 自动登录流程异常: {e}", "ERROR", exc_info=True)
-            return False
+            result = AutoLoginAttemptResult(
+                submitted=False,
+                detail=f"QQ 自动登录流程异常: {e}",
+                level="ERROR",
+            )
+            self._log(result.detail, result.level, exc_info=True)
+            return result
 
-        self._log(detail, "INFO" if success else "WARNING")
-        return success
+        result = AutoLoginAttemptResult(
+            submitted=success,
+            detail=detail,
+            level="INFO" if success else "WARNING",
+        )
+        self._log(result.detail, result.level)
+        return result
+
+    async def _wait_for_napcat_service_ready(
+        self,
+        *,
+        timeout_seconds: int = RECOVERY_SERVICE_READY_TIMEOUT_SECONDS,
+        poll_interval_seconds: int = RECOVERY_SERVICE_READY_POLL_SECONDS,
+    ) -> ServiceCheckResult:
+        attempts = max(
+            1,
+            (timeout_seconds + poll_interval_seconds - 1) // poll_interval_seconds,
+        )
+        last_result: ServiceCheckResult | None = None
+
+        for attempt in range(attempts):
+            last_result = await self._check_napcat_service_status(
+                timeout_seconds=max(1, min(2, poll_interval_seconds)),
+            )
+            if last_result.state == "online":
+                return last_result
+            if attempt < attempts - 1:
+                await asyncio.sleep(poll_interval_seconds)
+
+        if last_result is not None:
+            return last_result
+
+        return ServiceCheckResult(
+            state="error",
+            checked_url=self.napcat_url,
+            status_code=None,
+            detail=f"等待 NapCat 服务就绪超时（{timeout_seconds} 秒）。",
+        )
+
+    async def _verify_recovery_status(
+        self,
+        *,
+        max_attempts: int,
+        interval_seconds: int,
+    ) -> StatusSnapshot:
+        last_snapshot: StatusSnapshot | None = None
+
+        for attempt in range(max_attempts):
+            if attempt > 0:
+                await asyncio.sleep(interval_seconds)
+
+            snapshot = await self._collect_status_snapshot()
+            last_snapshot = snapshot
+            verify_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._emit_snapshot_logs(verify_time, snapshot)
+
+            if snapshot.overall_status == "online":
+                return snapshot
+
+            if attempt < max_attempts - 1:
+                wait_level = "WARNING" if snapshot.overall_status == "offline" else "ERROR"
+                self._log(
+                    f"[6/6] 快速验证未通过 ({attempt + 1}/{max_attempts})，"
+                    f"{interval_seconds} 秒后重试。"
+                    f" | 原因: {self._snapshot_failure_reason(snapshot)}",
+                    wait_level,
+                )
+
+        if last_snapshot is None:
+            raise RuntimeError("恢复验证未生成状态快照。")
+
+        return last_snapshot
 
     async def _collect_status_snapshot(self) -> StatusSnapshot:
         service = await self._check_napcat_service_status()
@@ -1275,39 +1389,79 @@ class NapcatKeeperPlugin(Star):
             await self._start_napcat()
             self._log("[3/6] ✓ 启动命令已执行")
 
-            self._log("[4/6] 等待 NapCat 启动 (15秒)...")
-            await asyncio.sleep(15)
+            self._log(
+                "[4/6] 等待 NapCat 服务就绪 "
+                f"(最长 {RECOVERY_SERVICE_READY_TIMEOUT_SECONDS} 秒，"
+                f"每 {RECOVERY_SERVICE_READY_POLL_SECONDS} 秒检查一次)..."
+            )
+            service_ready_result = await self._wait_for_napcat_service_ready()
+            if service_ready_result.state == "online":
+                self._log(
+                    "[4/6] ✓ NapCat 服务已就绪 "
+                    f"| 地址: {service_ready_result.checked_url} "
+                    f"| 说明: {service_ready_result.detail}"
+                )
+            else:
+                self._log(
+                    "[4/6] NapCat 服务尚未完全就绪，继续执行后续恢复流程。"
+                    f" | 说明: {service_ready_result.detail}",
+                    "WARNING",
+                )
 
             self._log("[5/6] 处理 QQ 自动登录...")
-            auto_login_submitted = False
+            auto_login_result = AutoLoginAttemptResult(
+                submitted=False,
+                detail="未执行 QQ 自动登录。",
+            )
             if self.enable_auto_login and self.qq_account:
-                auto_login_submitted = await self._auto_login_qq()
-                if auto_login_submitted:
-                    self._log("[5/6] ✓ 已提交 QQ 自动登录请求，等待登录态刷新 (8秒)...")
-                    await asyncio.sleep(8)
+                auto_login_result = await self._auto_login_qq()
+                if auto_login_result.submitted:
+                    self._log(
+                        "[5/6] ✓ QQ 自动登录已提交，进入快速验证阶段。"
+                        f" | 结果: {auto_login_result.detail}"
+                    )
                 else:
-                    self._log("[5/6] QQ 自动登录未成功提交，继续验证当前状态。", "WARNING")
+                    self._log(
+                        "[5/6] QQ 自动登录未成功。"
+                        f" | 原因: {auto_login_result.detail}",
+                        "WARNING",
+                    )
             elif self.enable_auto_login:
                 self._log("[5/6] 已跳过 QQ 自动登录: 未配置 qq_account。")
             else:
                 self._log("[5/6] 已跳过 QQ 自动登录: 配置已禁用。")
 
-            self._log("[6/6] 验证恢复结果...")
-            status = "error"
-            for i in range(3):
-                snapshot = await self._collect_status_snapshot()
-                status = snapshot.overall_status
-                verify_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self._emit_snapshot_logs(verify_time, snapshot)
-                if status == "online":
-                    self._log("=" * 50)
-                    self._log("✓ NapCat 恢复成功!")
-                    self._log("=" * 50)
-                    return
-                self._log(f"[6/6] 等待验证... ({i + 1}/3)", "WARNING")
-                await asyncio.sleep(5)
+            verify_attempts = (
+                RECOVERY_VERIFY_ATTEMPTS_WITH_AUTO_LOGIN
+                if auto_login_result.submitted
+                else RECOVERY_VERIFY_ATTEMPTS_DEFAULT
+            )
+            self._log(
+                "[6/6] 开始快速验证恢复结果 "
+                f"(最多 {verify_attempts} 次，每 {RECOVERY_VERIFY_INTERVAL_SECONDS} 秒一次)..."
+            )
+            snapshot = await self._verify_recovery_status(
+                max_attempts=verify_attempts,
+                interval_seconds=RECOVERY_VERIFY_INTERVAL_SECONDS,
+            )
 
-            self._log(f"NapCat 恢复后综合状态: {STATUS_TEXT.get(status, status)}", "WARNING")
+            if snapshot.overall_status == "online":
+                self._log("=" * 50)
+                self._log("✓ NapCat 恢复成功!")
+                self._log("=" * 50)
+                return
+
+            auto_login_reason = ""
+            if self.enable_auto_login and self.qq_account and not auto_login_result.submitted:
+                auto_login_reason = f" | QQ 自动登录未成功原因: {auto_login_result.detail}"
+
+            final_level = "WARNING" if snapshot.overall_status == "offline" else "ERROR"
+            self._log(
+                f"NapCat 恢复后综合状态: "
+                f"{STATUS_TEXT.get(snapshot.overall_status, snapshot.overall_status)}"
+                f"{auto_login_reason}",
+                final_level,
+            )
 
         except Exception as e:
             self._log(f"恢复失败: {e}", "ERROR", exc_info=True)
