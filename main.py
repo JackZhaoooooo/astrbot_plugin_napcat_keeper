@@ -551,16 +551,28 @@ class NapcatKeeperPlugin(Star):
             return f"QQ 登录检测失败: {snapshot.login.detail}"
         return f"NapCat 服务异常: {snapshot.service.detail}"
 
-    @filter.on_astrbot_loaded()
-    async def on_astrbot_loaded(self):
-        """AstrBot 加载完成后启动监控。"""
+    async def _ensure_monitor_started(self, trigger: str) -> bool:
+        """幂等地启动监控任务，兼容安装后热加载与常规启动。"""
         if self._monitor_task and not self._monitor_task.done():
-            self._log("监控任务已在运行，跳过重复启动。", "WARNING")
-            return
+            self._log(
+                f"监控任务已在运行，跳过来自 {trigger} 的重复启动。",
+                "DEBUG",
+            )
+            return False
 
-        self._log("AstrBot 加载完成，启动 NapCat 保活监控...")
         self._is_monitoring = True
         self._monitor_task = asyncio.create_task(self._monitor_loop())
+        self._log(f"已通过 {trigger} 启动 NapCat 保活监控。")
+        return True
+
+    async def initialize(self):
+        """插件加载或热重载后立即启动监控。"""
+        await self._ensure_monitor_started("initialize()")
+
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self):
+        """AstrBot 加载完成后的兼容兜底，避免旧流程失效。"""
+        await self._ensure_monitor_started("on_astrbot_loaded()")
 
     async def _monitor_loop(self):
         """主监控循环。"""

@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import sys
 import types
@@ -154,6 +155,52 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[1][0], "WARNING")
         self.assertIn("综合判定", captured[2][1])
         self.assertEqual(captured[2][0], "WARNING")
+
+    async def test_initialize_starts_monitor_task_without_waiting_for_astrbot_loaded(self):
+        plugin = self.make_plugin()
+        gate = asyncio.Event()
+
+        async def fake_monitor_loop():
+            await gate.wait()
+
+        plugin._monitor_loop = fake_monitor_loop
+        captured = []
+        plugin._log = lambda message, level="INFO", **kwargs: captured.append(
+            (level, message, kwargs)
+        )
+
+        await plugin.initialize()
+
+        self.assertTrue(plugin._is_monitoring)
+        self.assertIsNotNone(plugin._monitor_task)
+        self.assertFalse(plugin._monitor_task.done())
+        self.assertTrue(any("initialize()" in item[1] for item in captured))
+
+        await plugin.terminate()
+
+    async def test_on_astrbot_loaded_does_not_duplicate_monitor_task_after_initialize(self):
+        plugin = self.make_plugin()
+        gate = asyncio.Event()
+
+        async def fake_monitor_loop():
+            await gate.wait()
+
+        plugin._monitor_loop = fake_monitor_loop
+        captured = []
+        plugin._log = lambda message, level="INFO", **kwargs: captured.append(
+            (level, message, kwargs)
+        )
+
+        await plugin.initialize()
+        first_task = plugin._monitor_task
+        await plugin.on_astrbot_loaded()
+
+        self.assertIs(plugin._monitor_task, first_task)
+        self.assertTrue(
+            any("重复启动" in item[1] and item[0] == "DEBUG" for item in captured)
+        )
+
+        await plugin.terminate()
 
     async def test_collect_status_snapshot_online_sets_login_info(self):
         plugin = self.make_plugin()
