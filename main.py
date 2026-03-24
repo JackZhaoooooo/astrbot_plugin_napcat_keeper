@@ -25,9 +25,15 @@ plugin_logger = logging.getLogger("NapcatKeeper")
 plugin_logger.setLevel(logging.INFO)
 plugin_logger.addHandler(file_handler)
 
+# 同时输出到 AstrBot console
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+plugin_logger.addHandler(console_handler)
+
 from astrbot.api.star import Context, Star
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api import logger
+from astrbot.api import logger as astrbot_logger
 from astrbot.api import AstrBotConfig
 
 
@@ -62,66 +68,78 @@ class NapcatKeeper(Star):
         self._login_info = None
         self._check_count = 0
         
-        # 使用独立日志
-        plugin_logger.info("=" * 50)
-        plugin_logger.info(" NapcatKeeper 插件初始化")
-        plugin_logger.info(f" NapCat URL: {self.napcat_url}")
-        plugin_logger.info(f" 检查间隔: {self.check_interval}秒")
-        plugin_logger.info(f" 自动恢复: {'启用' if self.enable_auto_restart else '禁用'}")
-        plugin_logger.info(f" 自动登录: {'启用' if self.enable_auto_login else '禁用'}")
-        plugin_logger.info("=" * 50)
+        # 输出到两个日志器
+        self._log("=" * 50, "INFO")
+        self._log(" NapcatKeeper 插件初始化", "INFO")
+        self._log(f" NapCat URL: {self.napcat_url}", "INFO")
+        self._log(f" 检查间隔: {self.check_interval}秒", "INFO")
+        self._log(f" 自动恢复: {'启用' if self.enable_auto_restart else '禁用'}", "INFO")
+        self._log(f" 自动登录: {'启用' if self.enable_auto_login else '禁用'}", "INFO")
+        self._log("=" * 50, "INFO")
         
-        # 同时输出到 AstrBot 日志
-        logger.info(f"[NapcatKeeper] 插件初始化完成")
+        astrbot_logger.info(f"[NapcatKeeper] 插件初始化完成")
+    
+    def _log(self, msg: str, level: str = "INFO"):
+        """同时输出到文件日志和 AstrBot logger"""
+        if level == "INFO":
+            plugin_logger.info(msg)
+            astrbot_logger.info(f"[NapcatKeeper] {msg}")
+        elif level == "WARNING":
+            plugin_logger.warning(msg)
+            astrbot_logger.warning(f"[NapcatKeeper] {msg}")
+        elif level == "ERROR":
+            plugin_logger.error(msg)
+            astrbot_logger.error(f"[NapcatKeeper] {msg}")
+        elif level == "DEBUG":
+            plugin_logger.debug(msg)
+            astrbot_logger.debug(f"[NapcatKeeper] {msg}")
     
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
         """AstrBot 加载完成后启动监控"""
-        plugin_logger.info("AstrBot 加载完成，启动 NapCat 保活监控...")
-        logger.info("[NapcatKeeper] AstrBot 加载完成，启动监控...")
+        self._log("AstrBot 加载完成，启动 NapCat 保活监控...", "INFO")
         self._is_monitoring = True
         self._monitor_task = asyncio.create_task(self._monitor_loop())
     
     async def _monitor_loop(self):
         """主监控循环"""
-        plugin_logger.info(f"监控循环已启动，每 {self.check_interval} 秒检测一次")
+        self._log(f"监控循环已启动，每 {self.check_interval} 秒检查一次", "INFO")
         
         while self._is_monitoring:
             try:
                 self._check_count += 1
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 
-                # 记录检测日志
-                plugin_logger.info(f"[{current_time}] 第 {self._check_count} 次检测 - 开始...")
+                self._log(f"[{current_time}] 第 {self._check_count} 次检查 - 开始...", "INFO")
                 
                 status = await self._check_napcat_status()
                 
                 if status == "online":
-                    plugin_logger.info(f"[{current_time}] 第 {self._check_count} 次检测 - 结果: 🟢 在线")
+                    self._log(f"[{current_time}] 第 {self._check_count} 次检查 - 结果: 🟢 在线", "INFO")
                     if self._consecutive_failures > 0:
-                        plugin_logger.info(f"[{current_time}] 状态已恢复正常 (连续失败 {self._consecutive_failures} 次后恢复)")
+                        self._log(f"[{current_time}] 状态已恢复正常 (连续失败 {self._consecutive_failures} 次后恢复)", "INFO")
                     self._consecutive_failures = 0
                     
                 elif status == "offline":
                     self._consecutive_failures += 1
-                    plugin_logger.warning(f"[{current_time}] 第 {self._check_count} 次检测 - 结果: 🔴 掉线 (第 {self._consecutive_failures}/{self.max_retries} 次)")
+                    self._log(f"[{current_time}] 第 {self._check_count} 次检查 - 结果: 🔴 掉线 (第 {self._consecutive_failures}/{self.max_retries} 次)", "WARNING")
                     
                     if self.enable_auto_restart and self._consecutive_failures >= self.max_retries:
-                        plugin_logger.error(f"[{current_time}] 连续失败达到阈值，开始执行恢复...")
+                        self._log(f"[{current_time}] 连续失败达到阈值，开始执行恢复...", "ERROR")
                         await self._recover_napcat()
                         self._consecutive_failures = 0
                 
                 elif status == "error":
                     self._consecutive_failures += 1
-                    plugin_logger.error(f"[{current_time}] 第 {self._check_count} 次检测 - 结果: ⚠️ 连接错误 (第 {self._consecutive_failures}/{self.max_retries} 次)")
+                    self._log(f"[{current_time}] 第 {self._check_count} 次检查 - 结果: ⚠️ 连接错误 (第 {self._consecutive_failures}/{self.max_retries} 次)", "ERROR")
                     
                     if self.enable_auto_restart and self._consecutive_failures >= self.max_retries:
-                        plugin_logger.error(f"[{current_time}] 连续失败达到阈值，开始执行恢复...")
+                        self._log(f"[{current_time}] 连续失败达到阈值，开始执行恢复...", "ERROR")
                         await self._recover_napcat()
                         self._consecutive_failures = 0
                         
             except Exception as e:
-                plugin_logger.error(f"监控循环异常: {e}")
+                self._log(f"监控循环异常: {e}", "ERROR")
             
             await asyncio.sleep(self.check_interval)
     
@@ -133,9 +151,8 @@ class NapcatKeeper(Star):
                 headers["Authorization"] = f"Bearer {self.napcat_token}"
             
             async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.napcat_url}/get_login_info",
-                    json={},
+                async with session.get(
+                    f"{self.napcat_url}/api/login_info",
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=5)
                 ) as resp:
@@ -143,76 +160,76 @@ class NapcatKeeper(Star):
                         data = await resp.json()
                         if data.get("status") == "ok" and data.get("retcode") == 0:
                             self._login_info = data.get("data", {})
-                            plugin_logger.debug(f"登录信息: {self._login_info}")
+                            self._log(f"登录信息: {self._login_info}", "DEBUG")
                             return "online"
-                        plugin_logger.warning(f"API返回异常: {data}")
+                        self._log(f"API返回异常: {data}", "WARNING")
                         return "offline"
-                    plugin_logger.warning(f"HTTP状态码: {resp.status}")
+                    self._log(f"HTTP状态码: {resp.status}", "WARNING")
                     return "error"
         except asyncio.TimeoutError:
-            plugin_logger.warning("API 请求超时")
+            self._log("API 请求超时", "WARNING")
             return "error"
         except aiohttp.ClientError as e:
-            plugin_logger.warning(f"API 连接失败: {e}")
+            self._log(f"API 连接失败: {e}", "WARNING")
             return "error"
         except Exception as e:
-            plugin_logger.error(f"检查状态异常: {e}")
+            self._log(f"检查状态异常: {e}", "ERROR")
             return "error"
     
     async def _recover_napcat(self):
         """恢复 NapCat"""
         self._last_restart_time = datetime.now()
-        plugin_logger.info("=" * 50)
-        plugin_logger.info(" 开始恢复 NapCat")
-        plugin_logger.info("=" * 50)
+        self._log("=" * 50, "INFO")
+        self._log(" 开始恢复 NapCat", "INFO")
+        self._log("=" * 50, "INFO")
         
         try:
             # 步骤1
-            plugin_logger.info("[1/4] 终止 QQ 进程...")
+            self._log("[1/4] 终止 QQ 进程...", "INFO")
             subprocess.run(["pkill", "-f", "qq"], stderr=subprocess.DEVNULL)
             await asyncio.sleep(2)
             subprocess.run(["pkill", "-9", "-f", "QQ"], stderr=subprocess.DEVNULL)
             await asyncio.sleep(1)
-            plugin_logger.info("[1/4] ✓ 进程已终止")
+            self._log("[1/4] ✓ 进程已终止", "INFO")
             
             # 步骤2
-            plugin_logger.info("[2/4] 清理残留状态...")
+            self._log("[2/4] 清理残留状态...", "INFO")
             await self._clear_login_state()
-            plugin_logger.info("[2/4] ✓ 状态已清理")
+            self._log("[2/4] ✓ 状态已清理", "INFO")
             
             # 步骤3
-            plugin_logger.info("[3/4] 启动 NapCat...")
+            self._log("[3/4] 启动 NapCat...", "INFO")
             await self._start_napcat()
-            plugin_logger.info("[3/4] ✓ 启动命令已执行")
+            self._log("[3/4] ✓ 启动命令已执行", "INFO")
             
             # 步骤4
-            plugin_logger.info("[4/4] 等待 NapCat 启动 (15秒)...")
+            self._log("[4/4] 等待 NapCat 启动 (15秒)...", "INFO")
             await asyncio.sleep(15)
             
             # 验证
             for i in range(3):
                 status = await self._check_napcat_status()
                 if status == "online":
-                    plugin_logger.info("=" * 50)
-                    plugin_logger.info(" ✓ NapCat 恢复成功!")
-                    plugin_logger.info("=" * 50)
+                    self._log("=" * 50, "INFO")
+                    self._log(" ✓ NapCat 恢复成功!", "INFO")
+                    self._log("=" * 50, "INFO")
                     return
-                plugin_logger.info(f"[4/4] 等待验证... ({i+1}/3)")
+                self._log(f"[4/4] 等待验证... ({i+1}/3)", "INFO")
                 await asyncio.sleep(5)
             
-            plugin_logger.warning(f"NapCat 恢复后状态: {status}")
+            self._log(f"NapCat 恢复后状态: {status}", "WARNING")
                 
         except Exception as e:
-            plugin_logger.error(f"恢复失败: {e}")
+            self._log(f"恢复失败: {e}", "ERROR")
     
     async def _clear_login_state(self):
         """清理登录状态"""
         try:
             napcat_data_dir = os.path.join(self.napcat_dir, "app", ".config", "QQ")
             if os.path.exists(napcat_data_dir):
-                plugin_logger.info(f"清理目录: {napcat_data_dir}")
+                self._log(f"清理目录: {napcat_data_dir}", "INFO")
         except Exception as e:
-            plugin_logger.warning(f"清理状态失败: {e}")
+            self._log(f"清理状态失败: {e}", "WARNING")
     
     async def _start_napcat(self):
         """启动 NapCat"""
@@ -225,7 +242,7 @@ class NapcatKeeper(Star):
                     stderr=subprocess.STDOUT,
                     start_new_session=True
                 )
-                plugin_logger.info(f"使用启动脚本: {self.launcher_script}")
+                self._log(f"使用启动脚本: {self.launcher_script}", "INFO")
             else:
                 subprocess.Popen(
                     ["bash", "-c", f"cd {self.napcat_dir} && ./launcher.sh"],
@@ -233,13 +250,13 @@ class NapcatKeeper(Star):
                     stderr=subprocess.STDOUT,
                     start_new_session=True
                 )
-                plugin_logger.info(f"使用备选启动: {self.napcat_dir}/launcher.sh")
+                self._log(f"使用备选启动: {self.napcat_dir}/launcher.sh", "INFO")
         except Exception as e:
-            plugin_logger.error(f"启动 NapCat 失败: {e}")
+            self._log(f"启动 NapCat 失败: {e}", "ERROR")
     
     async def terminate(self):
         """插件卸载"""
-        plugin_logger.info("插件卸载，停止监控...")
+        self._log("插件卸载，停止监控...", "INFO")
         self._is_monitoring = False
         if self._monitor_task:
             self._monitor_task.cancel()
@@ -248,7 +265,7 @@ class NapcatKeeper(Star):
             except asyncio.CancelledError:
                 pass
     
-    # ==================== 指令接口 ====================
+    # ==================== 命令接口 ====================
     
     @filter.command("napcat_status")
     async def cmd_status(self, event: AstrMessageEvent):
@@ -271,11 +288,11 @@ class NapcatKeeper(Star):
             
             message = (
                 f"📊 NapCat 状态监控\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"─────────────────────────────────\n"
                 f"🔗 地址: {self.napcat_url}\n"
                 f"📋 状态: {status_text}\n"
                 f"⏱️ 检查间隔: {self.check_interval}秒\n"
-                f"📊 已检测: {self._check_count} 次\n"
+                f"📈 已检查: {self._check_count} 次\n"
                 f"⚠️ 连续失败: {self._consecutive_failures}/{self.max_retries}\n"
                 f"🔧 自动恢复: {'启用' if self.enable_auto_restart else '禁用'}"
                 f"{login_info_text}"
@@ -308,13 +325,13 @@ class NapcatKeeper(Star):
         """查看插件帮助"""
         help_text = (
             "🔧 NapCat Keeper 保活插件\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "─────────────────────────────────\n"
             "/napcat_status - 查看 NapCat 当前状态\n"
             "/napcat_recover - 手动恢复 NapCat\n"
             "/napcat_logs - 查看最近日志\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "─────────────────────────────────\n"
             "💡 功能:\n"
-            "• 每分钟自动检测登录状态\n"
+            "• 每分钟自动检查登录状态\n"
             "• 掉线时自动重启恢复\n"
             "• 日志文件: /root/AstrBot/logs/napcat_keeper.log"
         )
