@@ -144,33 +144,25 @@ class NapcatKeeper(Star):
             await asyncio.sleep(self.check_interval)
     
     async def _check_napcat_status(self) -> str:
-        """检查 NapCat 登录状态"""
+        """检查 NapCat HTTP 端口是否可达"""
         try:
-            headers = {}
-            if self.napcat_token:
-                headers["Authorization"] = f"Bearer {self.napcat_token}"
-            
+            # 方案1: 只检测 HTTP 端口可达性
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    f"{self.napcat_url}/api/login_info",
-                    headers=headers,
+                    self.napcat_url,
                     timeout=aiohttp.ClientTimeout(total=5)
                 ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("status") == "ok" and data.get("retcode") == 0:
-                            self._login_info = data.get("data", {})
-                            self._log(f"登录信息: {self._login_info}", "DEBUG")
-                            return "online"
-                        self._log(f"API返回异常: {data}", "WARNING")
-                        return "offline"
-                    self._log(f"HTTP状态码: {resp.status}", "WARNING")
+                    if resp.status in [200, 301, 302, 303, 307, 308]:
+                        self._log(f"HTTP 状态码: {resp.status} - NapCat 在线", "DEBUG")
+                        return "online"
+                    self._log(f"HTTP 状态码异常: {resp.status}", "WARNING")
                     return "error"
+                    
         except asyncio.TimeoutError:
-            self._log("API 请求超时", "WARNING")
+            self._log("连接超时", "WARNING")
             return "error"
         except aiohttp.ClientError as e:
-            self._log(f"API 连接失败: {e}", "WARNING")
+            self._log(f"连接失败: {e}", "WARNING")
             return "error"
         except Exception as e:
             self._log(f"检查状态异常: {e}", "ERROR")
@@ -247,7 +239,7 @@ class NapcatKeeper(Star):
                 subprocess.Popen(
                     ["bash", "-c", f"cd {self.napcat_dir} && ./launcher.sh"],
                     stdout=open("/root/AstrBot/napcat_restart.log", "w"),
-                    stderr=subprocess.STDOUT,
+                    stderr=subprocess.STDOWT,
                     start_new_session=True
                 )
                 self._log(f"使用备选启动: {self.napcat_dir}/launcher.sh", "INFO")
@@ -257,7 +249,7 @@ class NapcatKeeper(Star):
     async def terminate(self):
         """插件卸载"""
         self._log("插件卸载，停止监控...", "INFO")
-        self._is_monitoring = False
+        self._self._is_monitoring = False
         if self._monitor_task:
             self._monitor_task.cancel()
             try:
@@ -297,7 +289,7 @@ class NapcatKeeper(Star):
                 f"🔧 自动恢复: {'启用' if self.enable_auto_restart else '禁用'}"
                 f"{login_info_text}"
                 f"{restart_info}\n"
-                f"📁 日志文件: /root/AstrBot/logs/napcat_keeper.log"
+                f"📁 日志文件: /root/AstrBot/logs/napcat_k死活的 /napcat_keeper.log"
             )
             yield event.plain_result(message)
             
@@ -328,10 +320,10 @@ class NapcatKeeper(Star):
             "─────────────────────────────────\n"
             "/napcat_status - 查看 NapCat 当前状态\n"
             "/napcat_recover - 手动恢复 NapCat\n"
-            "/napcat_logs - 查看最近日志\n"
+            "/napcat_keeper_help - 查看帮助\n"
             "─────────────────────────────────\n"
             "💡 功能:\n"
-            "• 每分钟自动检查登录状态\n"
+            "• 每分钟自动检查端口状态\n"
             "• 掉线时自动重启恢复\n"
             "• 日志文件: /root/AstrBot/logs/napcat_keeper.log"
         )
