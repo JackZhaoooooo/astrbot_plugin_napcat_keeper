@@ -142,6 +142,7 @@ class NapcatKeeperPlugin(Star):
         self._last_snapshot = None
         self._webui_credential = None
         self._webui_credential_cached_at = 0.0
+        self._notification_blocked_umos: dict[str, str] = {}
 
         self._log("=" * 50)
         self._log("NapcatKeeper 插件初始化")
@@ -718,6 +719,63 @@ class NapcatKeeperPlugin(Star):
             return f"{login.nickname or '未知昵称'} ({login.user_id})"
         return "未识别到登录账号"
 
+    def _resolve_platform_meta_for_umo(self, umo: str) -> Any | None:
+        platform_id = str(umo or "").split(":", 1)[0].strip()
+        if not platform_id:
+            return None
+
+        platform_manager = getattr(self.context, "platform_manager", None)
+        platform_insts = getattr(platform_manager, "platform_insts", None)
+        if not platform_insts:
+            return None
+
+        for platform in platform_insts:
+            meta_getter = getattr(platform, "meta", None)
+            if not callable(meta_getter):
+                continue
+            try:
+                meta = meta_getter()
+            except Exception:
+                continue
+            if getattr(meta, "id", None) == platform_id:
+                return meta
+        return None
+
+    def _get_notification_block_reason_for_umo(self, umo: str) -> str | None:
+        meta = self._resolve_platform_meta_for_umo(umo)
+        if meta is None:
+            return None
+
+        platform_name = str(getattr(meta, "name", "") or "").strip().lower()
+        if platform_name in {"qq_official", "qq_official_webhook"}:
+            return (
+                "QQ 官方平台会话依赖最近一条有效消息的 msg_id，"
+                "AstrBot 当前无法通过该 UMO 主动发送通知。"
+                "请改用其他平台/群聊 UMO，或先在该会话中重新与机器人交互。"
+            )
+
+        return None
+
+    @staticmethod
+    def _get_notification_block_reason_from_exception(error: Exception) -> str | None:
+        detail = str(error or "").strip()
+        if not detail:
+            return None
+
+        lowered = detail.lower()
+        if "msg_id" in lowered and (
+            "无效" in detail
+            or "越权" in detail
+            or "invalid" in lowered
+            or "unauthorized" in lowered
+        ):
+            return (
+                "当前会话的 msg_id 已失效或无权限，AstrBot 无法继续通过该 UMO 主动发送通知。"
+                "请先在该会话中重新与机器人交互，或改用其他平台/群聊 UMO。"
+            )
+
+        return None
+
     def _build_transition_notification_message(
         self,
         kind: str,
@@ -763,6 +821,24 @@ class NapcatKeeperPlugin(Star):
             return
 
         for umo in targets:
+            blocked_reason = self._notification_blocked_umos.get(umo)
+            if blocked_reason:
+                self._log(
+                    f"{label}已跳过，当前 UMO 已标记为不可主动通知"
+                    f" | UMO: {umo} | 原因: {blocked_reason}",
+                    "DEBUG",
+                )
+                continue
+
+            blocked_reason = self._get_notification_block_reason_for_umo(umo)
+            if blocked_reason:
+                self._notification_blocked_umos[umo] = blocked_reason
+                self._log(
+                    f"{label}已跳过 | UMO: {umo} | 原因: {blocked_reason}",
+                    "WARNING",
+                )
+                continue
+
             try:
                 delivered = await self.context.send_message(
                     umo,
@@ -776,6 +852,15 @@ class NapcatKeeperPlugin(Star):
                         "WARNING",
                     )
             except Exception as e:
+                blocked_reason = self._get_notification_block_reason_from_exception(e)
+                if blocked_reason:
+                    self._notification_blocked_umos[umo] = blocked_reason
+                    self._log(
+                        f"{label}已跳过 | UMO: {umo} | 原因: {blocked_reason}",
+                        "WARNING",
+                    )
+                    continue
+
                 self._log(
                     f"{label}发送异常 | UMO: {umo} | 错误: {e}",
                     "ERROR",

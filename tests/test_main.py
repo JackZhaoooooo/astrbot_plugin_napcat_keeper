@@ -61,6 +61,21 @@ class DummyMessageChain:
         return " ".join(item.text for item in self.chain)
 
 
+class DummyPlatformMeta:
+    def __init__(self, *, id, name, description=""):
+        self.id = id
+        self.name = name
+        self.description = description
+
+
+class DummyPlatform:
+    def __init__(self, *, id, name, description=""):
+        self._meta = DummyPlatformMeta(id=id, name=name, description=description)
+
+    def meta(self):
+        return self._meta
+
+
 def install_astrbot_stubs():
     logger = DummyLogger()
 
@@ -276,6 +291,89 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result,
             ["umo-1", "umo-2", "umo-3", "umo-4", "umo-5", "umo-6", "umo-7"],
+        )
+
+    async def test_send_notification_to_umos_skips_qq_official_session_proactively(self):
+        context = types.SimpleNamespace(
+            send_message=AsyncMock(return_value=True),
+            platform_manager=types.SimpleNamespace(
+                platform_insts=[
+                    DummyPlatform(
+                        id="default",
+                        name="qq_official",
+                        description="QQ 机器人官方 API 适配器",
+                    )
+                ]
+            ),
+        )
+        plugin = self.make_plugin(context=context)
+        captured = []
+        plugin._log = lambda message, level="INFO", **kwargs: captured.append(
+            (level, message)
+        )
+
+        await plugin._send_notification_to_umos(
+            ["default:FriendMessage:session-1"],
+            "test message",
+            "重新登录通知",
+        )
+        await plugin._send_notification_to_umos(
+            ["default:FriendMessage:session-1"],
+            "test message",
+            "重新登录通知",
+        )
+
+        self.assertEqual(context.send_message.await_count, 0)
+        self.assertTrue(
+            any(
+                level == "WARNING"
+                and "QQ 官方平台会话依赖最近一条有效消息的 msg_id" in message
+                for level, message in captured
+            )
+        )
+        self.assertTrue(
+            any(
+                level == "DEBUG"
+                and "已标记为不可主动通知" in message
+                for level, message in captured
+            )
+        )
+
+    async def test_send_notification_to_umos_disables_umo_after_invalid_msg_id_error(self):
+        context = types.SimpleNamespace(
+            send_message=AsyncMock(side_effect=RuntimeError("请求参数msg_id无效或越权"))
+        )
+        plugin = self.make_plugin(context=context)
+        captured = []
+        plugin._log = lambda message, level="INFO", **kwargs: captured.append(
+            (level, message)
+        )
+
+        await plugin._send_notification_to_umos(
+            ["default:FriendMessage:session-2"],
+            "test message",
+            "退出登录通知",
+        )
+        await plugin._send_notification_to_umos(
+            ["default:FriendMessage:session-2"],
+            "test message",
+            "退出登录通知",
+        )
+
+        self.assertEqual(context.send_message.await_count, 1)
+        self.assertTrue(
+            any(
+                level == "WARNING"
+                and "msg_id 已失效或无权限" in message
+                for level, message in captured
+            )
+        )
+        self.assertTrue(
+            any(
+                level == "DEBUG"
+                and "已标记为不可主动通知" in message
+                for level, message in captured
+            )
         )
 
     async def test_handle_login_transition_notifications_sends_logout_to_multiple_umos(self):
