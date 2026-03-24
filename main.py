@@ -4,13 +4,14 @@ NapCat QQ 保活插件
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import aiohttp
 
@@ -22,6 +23,7 @@ PLUGIN_TAG = "[NapcatKeeper]"
 LOG_FILE = "/root/AstrBot/logs/napcat_keeper.log"
 FILE_LOGGER_NAME = "astrbot_plugin_napcat_keeper.file"
 SUCCESS_HTTP_CODES = {200, 301, 302, 303, 307, 308}
+WEBUI_SUCCESS_CODES = {0, "0"}
 STATUS_TEXT = {
     "online": "🟢 在线",
     "offline": "🟡 未登录",
@@ -123,6 +125,7 @@ class NapcatKeeperPlugin(Star):
         self._log(f"检查间隔: {self.check_interval}秒")
         self._log(f"自动恢复: {'启用' if self.enable_auto_restart else '禁用'}")
         self._log(f"自动登录: {'启用' if self.enable_auto_login else '禁用'}")
+        self._log(f"自动登录账号: {'已配置' if self.qq_account else '未配置'}")
         self._log("=" * 50)
 
     def _log(self, msg: str, level: str = "INFO", *, exc_info=False):
@@ -145,6 +148,35 @@ class NapcatKeeperPlugin(Star):
         if token:
             headers["Authorization"] = f"Bearer {token}"
         return headers
+
+    @staticmethod
+    def _build_webui_auth_headers(credential: str) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if credential:
+            headers["Authorization"] = f"Bearer {credential}"
+        return headers
+
+    def _normalize_napcat_root_url(self) -> str:
+        raw_url = (self.napcat_url or "http://localhost:6099").strip()
+        parsed = urlsplit(raw_url)
+        path = (parsed.path or "").rstrip("/")
+        for suffix in ("/webui", "/api"):
+            if path.endswith(suffix):
+                path = path[: -len(suffix)]
+                break
+        return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
+
+    def _build_webui_api_url(self, path: str) -> str:
+        api_path = f"api/{path.lstrip('/')}"
+        return urljoin(self._normalize_napcat_root_url().rstrip("/") + "/", api_path)
+
+    @staticmethod
+    def _hash_webui_token(token: str) -> str:
+        return hashlib.sha256(f"{token}.napcat".encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _password_md5(password: str) -> str:
+        return hashlib.md5(password.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _normalize_user_id(raw_user_id: Any) -> str | None:
@@ -192,6 +224,20 @@ class NapcatKeeperPlugin(Star):
         return None
 
     @staticmethod
+    def _extract_webui_message(payload: dict[str, Any] | None) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+
+        message = payload.get("message")
+        if message in (None, ""):
+            return None
+
+        text = str(message).strip()
+        if not text or text.lower() == "success":
+            return None
+        return text
+
+    @staticmethod
     def _looks_like_not_logged_in(message: str | None) -> bool:
         if not message:
             return False
@@ -206,6 +252,141 @@ class NapcatKeeperPlugin(Star):
             "login required",
         ]
         return any(keyword in lowered for keyword in keywords)
+
+    @staticmethod
+    def _looks_like_already_logged_in(message: str | None) -> bool:
+        if not message:
+            return False
+        lowered = message.lower()
+        keywords = [
+            "qq is logined",
+            "already login",
+            "already logged",
+            "已登录",
+        ]
+        return any(keyword in lowered for keyword in keywords)
+
+    @staticmethod
+    def _is_webui_success(payload: dict[str, Any] | None) -> bool:
+        return isinstance(payload, dict) and payload.get("code") in WEBUI_SUCCESS_CODES
+
+    @staticmethod
+    def _extract_webui_response_data(payload: dict[str, Any] | None) -> Any:
+        if not isinstance(payload, dict):
+            return None
+        return payload.get("data")
+
+    @staticmethod
+    def _summarize_response_text(text: str | None, *, limit: int = 160) -> str | None:
+        if not text:
+            return None
+        compact = " ".join(text.split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3] + "..."
+
+    @classmethod
+    def _build_webui_error_detail(
+        cls,
+        action: str,
+        payload: dict[str, Any] | None = None,
+        raw_text: str | None = None,
+    ) -> str:
+        message = cls._extract_webui_message(payload) or cls._summarize_response_text(
+            raw_text
+        )
+        if message:
+            return f"{action}: {message}"
+        return action
+
+    async def _post_json_request(
+        self,
+        session: aiohttp.ClientSession,
+        endpoint: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, Any] | None, str | None]:
+        async with session.post(
+            endpoint,
+            json=payload or {},
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            try:
+                response_payload = await resp.json(content_type=None)
+                raw_text = None
+            except (aiohttp.ContentTypeError, ValueError):
+                response_payload = None
+                raw_text = await resp.text()
+            return (
+                resp.status,
+                response_payload,
+                self._summarize_response_text(raw_text),
+            )
+
+    async def _request_webui_credential(
+        self,
+        *,
+        session: aiohttp.ClientSession | None = None,
+    ) -> str:
+        token = (self.napcat_token or "").strip()
+        if not token:
+            raise ValueError("未配置 napcat_token，无法向 NapCat WebUI 申请凭证。")
+
+        endpoint = self._build_webui_api_url("/auth/login")
+        created_session = session is None
+        if created_session:
+            session = aiohttp.ClientSession()
+
+        try:
+            status_code, payload, raw_text = await self._post_json_request(
+                session,
+                endpoint,
+                payload={"hash": self._hash_webui_token(token)},
+                headers={"Content-Type": "application/json"},
+            )
+        finally:
+            if created_session and session is not None:
+                await session.close()
+
+        if payload is None:
+            response_text = raw_text or f"HTTP {status_code}"
+            raise RuntimeError(
+                "NapCat WebUI 鉴权接口返回了非 JSON 响应。"
+                f" | 接口: {endpoint} | 响应: {response_text}"
+            )
+
+        if not self._is_webui_success(payload):
+            raise RuntimeError(
+                f"{self._build_webui_error_detail('NapCat WebUI 鉴权失败', payload, raw_text)}"
+                f" | 接口: {endpoint} | HTTP {status_code}"
+            )
+
+        data = self._extract_webui_response_data(payload)
+        credential = data.get("Credential") if isinstance(data, dict) else None
+        if not credential:
+            raise RuntimeError(
+                f"NapCat WebUI 鉴权成功，但未返回 Credential。 | 接口: {endpoint}"
+            )
+        return credential
+
+    async def _call_webui_api(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        *,
+        credential: str,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[str, int, dict[str, Any] | None, str | None]:
+        endpoint = self._build_webui_api_url(path)
+        status_code, response_payload, raw_text = await self._post_json_request(
+            session,
+            endpoint,
+            payload=payload,
+            headers=self._build_webui_auth_headers(credential),
+        )
+        return endpoint, status_code, response_payload, raw_text
 
     @classmethod
     def _build_service_result(
@@ -463,7 +644,7 @@ class NapcatKeeperPlugin(Star):
                 detail=f"检查服务状态时发生异常: {e}",
             )
 
-    async def _check_qq_login_status(self) -> LoginCheckResult:
+    async def _check_qq_login_status_via_onebot(self) -> LoginCheckResult:
         """调用 get_login_info 检查 QQ 登录态。"""
         endpoint = urljoin(self.napcat_url.rstrip("/") + "/", "get_login_info")
         try:
@@ -507,6 +688,353 @@ class NapcatKeeperPlugin(Star):
                 detail=f"检查 QQ 登录态时发生异常: {e}",
                 force_state="error",
             )
+
+    async def _check_qq_login_status_via_webui(self) -> LoginCheckResult:
+        """优先通过 NapCat WebUI 接口检查 QQ 登录态。"""
+        status_endpoint = self._build_webui_api_url("/QQLogin/CheckLoginStatus")
+        info_endpoint = self._build_webui_api_url("/QQLogin/GetQQLoginInfo")
+        endpoint_label = f"{status_endpoint} + {info_endpoint}"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                credential = await self._request_webui_credential(session=session)
+                (
+                    status_endpoint,
+                    status_code,
+                    status_payload,
+                    status_raw_text,
+                ) = await self._call_webui_api(
+                    session,
+                    "/QQLogin/CheckLoginStatus",
+                    credential=credential,
+                )
+
+                if status_payload is None:
+                    response_text = status_raw_text or f"HTTP {status_code}"
+                    return LoginCheckResult(
+                        state="error",
+                        endpoint=status_endpoint,
+                        detail=(
+                            "CheckLoginStatus 返回了非 JSON 响应。"
+                            f" | 响应: {response_text}"
+                        ),
+                    )
+
+                if not self._is_webui_success(status_payload):
+                    return LoginCheckResult(
+                        state="error",
+                        endpoint=status_endpoint,
+                        detail=(
+                            f"{self._build_webui_error_detail('调用 CheckLoginStatus 失败', status_payload, status_raw_text)}"
+                            f" | HTTP {status_code}"
+                        ),
+                    )
+
+                status_data = self._extract_webui_response_data(status_payload)
+                if not isinstance(status_data, dict):
+                    return LoginCheckResult(
+                        state="error",
+                        endpoint=status_endpoint,
+                        detail="CheckLoginStatus 返回格式异常，未包含 data 对象。",
+                    )
+
+                is_login = status_data.get("isLogin") is True
+                is_offline = status_data.get("isOffline") is True
+                login_error = status_data.get("loginError")
+
+                if not is_login and not is_offline:
+                    detail = "WebUI 检测到当前未登录 QQ。"
+                    if login_error not in (None, ""):
+                        detail = f"WebUI 检测到当前未登录 QQ: {str(login_error).strip()}"
+                    return LoginCheckResult(
+                        state="not_logged_in",
+                        endpoint=status_endpoint,
+                        detail=detail,
+                    )
+
+                (
+                    info_endpoint,
+                    info_code,
+                    info_payload,
+                    info_raw_text,
+                ) = await self._call_webui_api(
+                    session,
+                    "/QQLogin/GetQQLoginInfo",
+                    credential=credential,
+                )
+
+                user_id = None
+                nickname = None
+                info_failure = None
+                if info_payload is None:
+                    response_text = info_raw_text or f"HTTP {info_code}"
+                    info_failure = (
+                        "GetQQLoginInfo 返回了非 JSON 响应。"
+                        f" | 响应: {response_text}"
+                    )
+                elif not self._is_webui_success(info_payload):
+                    info_failure = (
+                        f"{self._build_webui_error_detail('调用 GetQQLoginInfo 失败', info_payload, info_raw_text)}"
+                        f" | HTTP {info_code}"
+                    )
+                else:
+                    user_id, nickname = self._extract_login_identity(info_payload)
+
+                account_text = (
+                    f"{nickname or '未知昵称'} ({user_id})"
+                    if user_id
+                    else "未识别到登录账号"
+                )
+
+                if is_login:
+                    detail = f"WebUI 检测到 QQ 已登录: {account_text}。"
+                    if info_failure:
+                        detail = f"WebUI 检测到 QQ 已登录，但读取账号信息失败: {info_failure}"
+                    return LoginCheckResult(
+                        state="logged_in",
+                        endpoint=f"{status_endpoint} + {info_endpoint}",
+                        detail=detail,
+                        user_id=user_id,
+                        nickname=nickname,
+                    )
+
+                detail = f"WebUI 检测到 QQ 账号当前处于离线状态: {account_text}。"
+                if info_failure:
+                    detail = (
+                        "WebUI 检测到 QQ 账号当前处于离线状态，"
+                        f"但读取账号信息失败: {info_failure}"
+                    )
+                return LoginCheckResult(
+                    state="not_logged_in",
+                    endpoint=f"{status_endpoint} + {info_endpoint}",
+                    detail=detail,
+                    user_id=user_id,
+                    nickname=nickname,
+                )
+        except (ValueError, RuntimeError) as e:
+            return LoginCheckResult(
+                state="error",
+                endpoint=endpoint_label,
+                detail=str(e),
+            )
+        except asyncio.TimeoutError:
+            return LoginCheckResult(
+                state="error",
+                endpoint=endpoint_label,
+                detail="调用 NapCat WebUI QQ 登录接口超时（5 秒内未收到响应）。",
+            )
+        except aiohttp.ClientError as e:
+            return LoginCheckResult(
+                state="error",
+                endpoint=endpoint_label,
+                detail=f"调用 NapCat WebUI QQ 登录接口失败: {e}",
+            )
+        except Exception as e:
+            return LoginCheckResult(
+                state="error",
+                endpoint=endpoint_label,
+                detail=f"NapCat WebUI QQ 登录检测异常: {e}",
+            )
+
+    async def _check_qq_login_status(self) -> LoginCheckResult:
+        """优先使用 WebUI QQLogin 接口，必要时回退到 get_login_info。"""
+        webui_result = await self._check_qq_login_status_via_webui()
+        if webui_result.state != "error":
+            return webui_result
+
+        onebot_result = await self._check_qq_login_status_via_onebot()
+        if onebot_result.state != "error":
+            return onebot_result
+
+        return LoginCheckResult(
+            state="error",
+            endpoint=f"{webui_result.endpoint} | {onebot_result.endpoint}",
+            detail=(
+                f"NapCat WebUI 检测失败: {webui_result.detail}；"
+                f"备用 get_login_info 检测也失败: {onebot_result.detail}"
+            ),
+        )
+
+    async def _quick_login_by_account(
+        self,
+        session: aiohttp.ClientSession,
+        credential: str,
+        account: str,
+    ) -> tuple[bool, str]:
+        (
+            config_endpoint,
+            config_code,
+            config_payload,
+            config_raw_text,
+        ) = await self._call_webui_api(
+            session,
+            "/QQLogin/SetQuickLoginQQ",
+            credential=credential,
+            payload={"uin": account},
+        )
+        if config_payload is None:
+            response_text = config_raw_text or f"HTTP {config_code}"
+            return (
+                False,
+                "写入快速登录账号失败。"
+                f" | 接口: {config_endpoint} | 响应: {response_text}",
+            )
+
+        if not self._is_webui_success(config_payload):
+            return (
+                False,
+                f"{self._build_webui_error_detail('写入快速登录账号失败', config_payload, config_raw_text)}"
+                f" | 接口: {config_endpoint} | HTTP {config_code}",
+            )
+
+        (
+            login_endpoint,
+            login_code,
+            login_payload,
+            login_raw_text,
+        ) = await self._call_webui_api(
+            session,
+            "/QQLogin/SetQuickLogin",
+            credential=credential,
+            payload={"uin": account},
+        )
+        if login_payload is None:
+            response_text = login_raw_text or f"HTTP {login_code}"
+            return (
+                False,
+                "触发快速登录失败，接口返回了非 JSON 响应。"
+                f" | 接口: {login_endpoint} | 响应: {response_text}",
+            )
+
+        login_message = self._extract_webui_message(login_payload)
+        if not self._is_webui_success(login_payload):
+            if self._looks_like_already_logged_in(login_message):
+                return (
+                    True,
+                    f"QQ {account} 当前已经处于登录状态，无需重复执行快速登录。"
+                    f" | 接口: {login_endpoint}",
+                )
+            return (
+                False,
+                f"{self._build_webui_error_detail('触发快速登录失败', login_payload, login_raw_text)}"
+                f" | 接口: {login_endpoint} | HTTP {login_code}",
+            )
+
+        return (
+            True,
+            f"已为 QQ {account} 提交快速登录请求。 | 接口: {login_endpoint}",
+        )
+
+    async def _password_login_by_account(
+        self,
+        session: aiohttp.ClientSession,
+        credential: str,
+        account: str,
+        password: str,
+    ) -> tuple[bool, str]:
+        (
+            endpoint,
+            status_code,
+            payload,
+            raw_text,
+        ) = await self._call_webui_api(
+            session,
+            "/QQLogin/PasswordLogin",
+            credential=credential,
+            payload={
+                "uin": account,
+                "passwordMd5": self._password_md5(password),
+            },
+        )
+
+        if payload is None:
+            response_text = raw_text or f"HTTP {status_code}"
+            return (
+                False,
+                "QQ 密码登录接口返回了非 JSON 响应。"
+                f" | 接口: {endpoint} | 响应: {response_text}",
+            )
+
+        message = self._extract_webui_message(payload)
+        if not self._is_webui_success(payload):
+            if self._looks_like_already_logged_in(message):
+                return (
+                    True,
+                    f"QQ {account} 当前已经处于登录状态，无需重复执行密码登录。"
+                    f" | 接口: {endpoint}",
+                )
+            return (
+                False,
+                f"{self._build_webui_error_detail('QQ 密码登录失败', payload, raw_text)}"
+                f" | 接口: {endpoint} | HTTP {status_code}",
+            )
+
+        data = self._extract_webui_response_data(payload)
+        if isinstance(data, dict) and data.get("needCaptcha"):
+            proof_url = data.get("proofWaterUrl")
+            detail = "QQ 密码登录需要验证码，当前无法自动完成后续步骤。"
+            if proof_url:
+                detail = f"{detail} | 验证地址: {proof_url}"
+            return False, detail
+
+        if isinstance(data, dict) and data.get("needNewDevice"):
+            jump_url = data.get("jumpUrl")
+            detail = "QQ 密码登录触发新设备验证，当前无法自动完成后续步骤。"
+            if jump_url:
+                detail = f"{detail} | 验证地址: {jump_url}"
+            return False, detail
+
+        return (
+            True,
+            f"已为 QQ {account} 提交密码登录请求。 | 接口: {endpoint}",
+        )
+
+    async def _auto_login_qq(self) -> bool:
+        account = str(self.qq_account or "").strip()
+        password = str(self.qq_password or "").strip()
+        if not self.enable_auto_login:
+            self._log("已禁用 QQ 自动登录，跳过自动登录流程。")
+            return False
+
+        if not account:
+            self._log("未配置 qq_account，跳过 QQ 自动登录。")
+            return False
+
+        login_mode = "密码登录" if password else "快速登录"
+        self._log(f"准备执行 QQ 自动登录 | 账号: {account} | 方式: {login_mode}")
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                credential = await self._request_webui_credential(session=session)
+                self._log("NapCat WebUI 鉴权成功，已获取临时 Credential。")
+                if password:
+                    success, detail = await self._password_login_by_account(
+                        session,
+                        credential,
+                        account,
+                        password,
+                    )
+                else:
+                    success, detail = await self._quick_login_by_account(
+                        session,
+                        credential,
+                        account,
+                    )
+        except (ValueError, RuntimeError) as e:
+            self._log(str(e), "ERROR")
+            return False
+        except asyncio.TimeoutError:
+            self._log("QQ 自动登录超时（5 秒内未收到响应）。", "ERROR")
+            return False
+        except aiohttp.ClientError as e:
+            self._log(f"QQ 自动登录请求失败: {e}", "ERROR")
+            return False
+        except Exception as e:
+            self._log(f"QQ 自动登录流程异常: {e}", "ERROR", exc_info=True)
+            return False
+
+        self._log(detail, "INFO" if success else "WARNING")
+        return success
 
     async def _collect_status_snapshot(self) -> StatusSnapshot:
         service = await self._check_napcat_service_status()
@@ -554,7 +1082,7 @@ class NapcatKeeperPlugin(Star):
         self._log("=" * 50)
 
         try:
-            self._log("[1/4] 终止 QQ 进程...")
+            self._log("[1/6] 终止 QQ 进程...")
             subprocess.run(["pkill", "-f", "qq"], check=False, stderr=subprocess.DEVNULL)
             await asyncio.sleep(2)
             subprocess.run(
@@ -563,19 +1091,34 @@ class NapcatKeeperPlugin(Star):
                 stderr=subprocess.DEVNULL,
             )
             await asyncio.sleep(1)
-            self._log("[1/4] ✓ 进程已终止")
+            self._log("[1/6] ✓ 进程已终止")
 
-            self._log("[2/4] 清理残留状态...")
+            self._log("[2/6] 清理残留状态...")
             await self._clear_login_state()
-            self._log("[2/4] ✓ 状态已清理")
+            self._log("[2/6] ✓ 状态已清理")
 
-            self._log("[3/4] 启动 NapCat...")
+            self._log("[3/6] 启动 NapCat...")
             await self._start_napcat()
-            self._log("[3/4] ✓ 启动命令已执行")
+            self._log("[3/6] ✓ 启动命令已执行")
 
-            self._log("[4/4] 等待 NapCat 启动 (15秒)...")
+            self._log("[4/6] 等待 NapCat 启动 (15秒)...")
             await asyncio.sleep(15)
 
+            self._log("[5/6] 处理 QQ 自动登录...")
+            auto_login_submitted = False
+            if self.enable_auto_login and self.qq_account:
+                auto_login_submitted = await self._auto_login_qq()
+                if auto_login_submitted:
+                    self._log("[5/6] ✓ 已提交 QQ 自动登录请求，等待登录态刷新 (8秒)...")
+                    await asyncio.sleep(8)
+                else:
+                    self._log("[5/6] QQ 自动登录未成功提交，继续验证当前状态。", "WARNING")
+            elif self.enable_auto_login:
+                self._log("[5/6] 已跳过 QQ 自动登录: 未配置 qq_account。")
+            else:
+                self._log("[5/6] 已跳过 QQ 自动登录: 配置已禁用。")
+
+            self._log("[6/6] 验证恢复结果...")
             status = "error"
             for i in range(3):
                 snapshot = await self._collect_status_snapshot()
@@ -587,7 +1130,7 @@ class NapcatKeeperPlugin(Star):
                     self._log("✓ NapCat 恢复成功!")
                     self._log("=" * 50)
                     return
-                self._log(f"[4/4] 等待验证... ({i + 1}/3)", "WARNING")
+                self._log(f"[6/6] 等待验证... ({i + 1}/3)", "WARNING")
                 await asyncio.sleep(5)
 
             self._log(f"NapCat 恢复后综合状态: {STATUS_TEXT.get(status, status)}", "WARNING")
