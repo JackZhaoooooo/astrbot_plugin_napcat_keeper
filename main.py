@@ -16,7 +16,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import aiohttp
 
 from astrbot.api import AstrBotConfig, logger as astrbot_logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
 
 PLUGIN_TAG = "[NapcatKeeper]"
@@ -110,6 +110,12 @@ class NapcatKeeperPlugin(Star):
 
         self.qq_account = config.get("qq_account", "")
         self.qq_password = config.get("qq_password", "")
+        self.logout_notify_umos = self._normalize_umo_list(
+            config.get("logout_notify_umos", [])
+        )
+        self.relogin_notify_umos = self._normalize_umo_list(
+            config.get("relogin_notify_umos", [])
+        )
 
         self._consecutive_failures = 0
         self._is_monitoring = False
@@ -126,6 +132,18 @@ class NapcatKeeperPlugin(Star):
         self._log(f"自动恢复: {'启用' if self.enable_auto_restart else '禁用'}")
         self._log(f"自动登录: {'启用' if self.enable_auto_login else '禁用'}")
         self._log(f"自动登录账号: {'已配置' if self.qq_account else '未配置'}")
+        logout_notify_text = (
+            f"退出登录通知: {len(self.logout_notify_umos)} 个 UMO"
+            if self.logout_notify_umos
+            else "退出登录通知: 未配置"
+        )
+        relogin_notify_text = (
+            f"重新登录通知: {len(self.relogin_notify_umos)} 个 UMO"
+            if self.relogin_notify_umos
+            else "重新登录通知: 未配置"
+        )
+        self._log(logout_notify_text)
+        self._log(relogin_notify_text)
         self._log("=" * 50)
 
     def _log(self, msg: str, level: str = "INFO", *, exc_info=False):
@@ -184,6 +202,27 @@ class NapcatKeeperPlugin(Star):
             return None
         user_id = str(raw_user_id).strip()
         return user_id or None
+
+    @staticmethod
+    def _normalize_umo_list(raw_value: Any) -> list[str]:
+        if raw_value in (None, ""):
+            return []
+
+        items = raw_value if isinstance(raw_value, (list, tuple, set)) else [raw_value]
+        normalized: list[str] = []
+        seen: set[str] = set()
+
+        for item in items:
+            if item in (None, ""):
+                continue
+            text = str(item).replace("，", ",").replace("\r", "\n")
+            for part in text.replace(",", "\n").split("\n"):
+                umo = part.strip()
+                if umo and umo not in seen:
+                    seen.add(umo)
+                    normalized.append(umo)
+
+        return normalized
 
     @classmethod
     def _extract_login_identity(
@@ -551,6 +590,125 @@ class NapcatKeeperPlugin(Star):
             return f"QQ 登录检测失败: {snapshot.login.detail}"
         return f"NapCat 服务异常: {snapshot.service.detail}"
 
+    @staticmethod
+    def _notification_login_state(snapshot: StatusSnapshot | None) -> str | None:
+        if snapshot is None:
+            return None
+        if snapshot.login is not None:
+            return snapshot.login.state
+        if snapshot.overall_status == "error":
+            return "error"
+        return None
+
+    @staticmethod
+    def _format_account_identity(login: LoginCheckResult | None) -> str:
+        if login and login.user_id:
+            return f"{login.nickname or '未知昵称'} ({login.user_id})"
+        return "未识别到登录账号"
+
+    def _build_transition_notification_message(
+        self,
+        kind: str,
+        previous_snapshot: StatusSnapshot,
+        current_snapshot: StatusSnapshot,
+        current_time: str,
+    ) -> str:
+        if kind == "logout":
+            identity_source = current_snapshot.login
+            if not identity_source or not identity_source.user_id:
+                identity_source = previous_snapshot.login
+            detail = (
+                current_snapshot.login.detail
+                if current_snapshot.login
+                else current_snapshot.service.detail
+            )
+            title = "NapCat Keeper 检测到 QQ 已退出登录"
+        else:
+            identity_source = current_snapshot.login or previous_snapshot.login
+            detail = (
+                current_snapshot.login.detail
+                if current_snapshot.login
+                else current_snapshot.service.detail
+            )
+            title = "NapCat Keeper 检测到 QQ 已重新登录"
+
+        return (
+            f"{title}\n"
+            f"账号: {self._format_account_identity(identity_source)}\n"
+            f"时间: {current_time}\n"
+            f"地址: {self.napcat_url}\n"
+            f"说明: {detail}"
+        )
+
+    async def _send_notification_to_umos(
+        self,
+        targets: list[str],
+        message: str,
+        label: str,
+    ):
+        if not targets:
+            self._log(f"检测到{label}事件，但未配置通知 UMO，跳过发送。", "DEBUG")
+            return
+
+        for umo in targets:
+            try:
+                delivered = await self.context.send_message(
+                    umo,
+                    MessageChain().message(message),
+                )
+                if delivered:
+                    self._log(f"{label}已发送 | UMO: {umo}")
+                else:
+                    self._log(
+                        f"{label}发送失败，未找到对应会话 | UMO: {umo}",
+                        "WARNING",
+                    )
+            except Exception as e:
+                self._log(
+                    f"{label}发送异常 | UMO: {umo} | 错误: {e}",
+                    "ERROR",
+                    exc_info=True,
+                )
+
+    async def _handle_login_transition_notifications(
+        self,
+        previous_snapshot: StatusSnapshot | None,
+        current_snapshot: StatusSnapshot,
+        current_time: str,
+    ):
+        previous_state = self._notification_login_state(previous_snapshot)
+        current_state = self._notification_login_state(current_snapshot)
+
+        if previous_state is None or current_state is None:
+            return
+
+        if previous_state == "logged_in" and current_state == "not_logged_in":
+            message = self._build_transition_notification_message(
+                "logout",
+                previous_snapshot,
+                current_snapshot,
+                current_time,
+            )
+            await self._send_notification_to_umos(
+                self.logout_notify_umos,
+                message,
+                "退出登录通知",
+            )
+            return
+
+        if previous_state in {"not_logged_in", "error"} and current_state == "logged_in":
+            message = self._build_transition_notification_message(
+                "relogin",
+                previous_snapshot,
+                current_snapshot,
+                current_time,
+            )
+            await self._send_notification_to_umos(
+                self.relogin_notify_umos,
+                message,
+                "重新登录通知",
+            )
+
     async def _ensure_monitor_started(self, trigger: str) -> bool:
         """幂等地启动监控任务，兼容安装后热加载与常规启动。"""
         if self._monitor_task and not self._monitor_task.done():
@@ -584,8 +742,15 @@ class NapcatKeeperPlugin(Star):
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self._log(f"[{current_time}] 第 {self._check_count} 次检查 - 开始巡检...")
 
+                previous_snapshot = self._last_snapshot
                 snapshot = await self._collect_status_snapshot()
                 self._emit_snapshot_logs(current_time, snapshot)
+                await self._handle_login_transition_notifications(
+                    previous_snapshot,
+                    snapshot,
+                    current_time,
+                )
+                self._last_snapshot = snapshot
 
                 if snapshot.overall_status == "online":
                     if self._consecutive_failures > 0:
@@ -1052,13 +1217,11 @@ class NapcatKeeperPlugin(Star):
         service = await self._check_napcat_service_status()
         if service.state != "online":
             self._login_info = None
-            snapshot = StatusSnapshot(
+            return StatusSnapshot(
                 overall_status="error",
                 service=service,
                 login=None,
             )
-            self._last_snapshot = snapshot
-            return snapshot
 
         login = await self._check_qq_login_status()
         if login.state == "logged_in":
@@ -1079,7 +1242,6 @@ class NapcatKeeperPlugin(Star):
             service=service,
             login=login,
         )
-        self._last_snapshot = snapshot
         return snapshot
 
     async def _check_napcat_status(self) -> str:

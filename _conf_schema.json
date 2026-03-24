@@ -59,6 +59,24 @@
         "hint": "留空则使用快速登录（需要先登录成功一次）",
         "default": ""
     },
+    "logout_notify_umos": {
+        "description": "退出登录通知",
+        "type": "list",
+        "hint": "填写一个或多个 UMO，会在 QQ 退出登录时主动通知",
+        "items": {
+            "type": "string"
+        },
+        "default": []
+    },
+    "relogin_notify_umos": {
+        "description": "重新登录通知",
+        "type": "list",
+        "hint": "填写一个或多个 UMO，会在 QQ 重新登录时主动通知",
+        "items": {
+            "type": "string"
+        },
+        "default": []
+    },
     "notify_on_restart": {
         "description": "恢复后发送通知",
         "type": "bool",

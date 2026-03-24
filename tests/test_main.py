@@ -44,6 +44,23 @@ class DummyEvent:
         return message
 
 
+class DummyPlain:
+    def __init__(self, text):
+        self.text = text
+
+
+class DummyMessageChain:
+    def __init__(self):
+        self.chain = []
+
+    def message(self, message):
+        self.chain.append(DummyPlain(message))
+        return self
+
+    def get_plain_text(self):
+        return " ".join(item.text for item in self.chain)
+
+
 def install_astrbot_stubs():
     logger = DummyLogger()
 
@@ -55,6 +72,7 @@ def install_astrbot_stubs():
     api_module.AstrBotConfig = dict
     api_module.logger = logger
     event_module.AstrMessageEvent = DummyEvent
+    event_module.MessageChain = DummyMessageChain
     event_module.filter = DummyFilter()
     star_module.Context = object
     star_module.Star = DummyStar
@@ -78,10 +96,45 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.module, self.platform_logger = load_plugin_module()
 
-    def make_plugin(self, config=None):
+    def make_plugin(self, config=None, context=None):
+        if context is None:
+            context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))
         with patch.object(self.module, "_get_file_logger", return_value=DummyLogger()):
-            plugin = self.module.NapcatKeeperPlugin(object(), config or {})
+            plugin = self.module.NapcatKeeperPlugin(context, config or {})
         return plugin
+
+    def make_snapshot(
+        self,
+        overall_status,
+        *,
+        service_state="online",
+        service_detail="HTTP 301，NapCat 服务可达。",
+        service_url="http://localhost:6099",
+        login_state=None,
+        login_detail=None,
+        user_id=None,
+        nickname=None,
+        endpoint="http://localhost:6099/get_login_info",
+    ):
+        login = None
+        if login_state is not None:
+            login = self.module.LoginCheckResult(
+                state=login_state,
+                endpoint=endpoint,
+                detail=login_detail or "默认登录说明",
+                user_id=user_id,
+                nickname=nickname,
+            )
+        return self.module.StatusSnapshot(
+            overall_status=overall_status,
+            service=self.module.ServiceCheckResult(
+                state=service_state,
+                checked_url=service_url,
+                status_code=301 if service_state == "online" else None,
+                detail=service_detail,
+            ),
+            login=login,
+        )
 
     def test_extract_login_identity_from_payload(self):
         user_id, nickname = self.module.NapcatKeeperPlugin._extract_login_identity(
@@ -155,6 +208,169 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[1][0], "WARNING")
         self.assertIn("综合判定", captured[2][1])
         self.assertEqual(captured[2][0], "WARNING")
+
+    def test_normalize_umo_list_supports_multiple_formats_and_deduplicates(self):
+        result = self.module.NapcatKeeperPlugin._normalize_umo_list(
+            [
+                "  umo-1  ",
+                "umo-2, umo-3",
+                "umo-3",
+                "umo-4\numo-5",
+                "umo-6，umo-7",
+                "",
+                None,
+            ]
+        )
+
+        self.assertEqual(
+            result,
+            ["umo-1", "umo-2", "umo-3", "umo-4", "umo-5", "umo-6", "umo-7"],
+        )
+
+    async def test_handle_login_transition_notifications_sends_logout_to_multiple_umos(self):
+        context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))
+        plugin = self.make_plugin(
+            {
+                "logout_notify_umos": ["platform:1", " platform:2 ", "platform:1"],
+            },
+            context=context,
+        )
+        plugin._log = lambda *args, **kwargs: None
+
+        previous_snapshot = self.make_snapshot(
+            "online",
+            login_state="logged_in",
+            login_detail="WebUI 检测到 QQ 已登录: NapCatBot (123456789)。",
+            user_id="123456789",
+            nickname="NapCatBot",
+        )
+        current_snapshot = self.make_snapshot(
+            "offline",
+            login_state="not_logged_in",
+            login_detail="WebUI 检测到当前未登录 QQ。",
+        )
+
+        await plugin._handle_login_transition_notifications(
+            previous_snapshot,
+            current_snapshot,
+            "2026-03-24 20:00:00",
+        )
+
+        self.assertEqual(context.send_message.await_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in context.send_message.await_args_list],
+            ["platform:1", "platform:2"],
+        )
+        message = context.send_message.await_args_list[0].args[1].get_plain_text()
+        self.assertIn("NapCat Keeper 检测到 QQ 已退出登录", message)
+        self.assertIn("NapCatBot (123456789)", message)
+        self.assertIn("WebUI 检测到当前未登录 QQ。", message)
+
+    async def test_handle_login_transition_notifications_sends_relogin_notice(self):
+        context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))
+        plugin = self.make_plugin(
+            {
+                "relogin_notify_umos": "platform:1,\nplatform:2",
+            },
+            context=context,
+        )
+        plugin._log = lambda *args, **kwargs: None
+
+        previous_snapshot = self.make_snapshot(
+            "error",
+            service_state="error",
+            service_detail="连接失败: connection refused",
+        )
+        current_snapshot = self.make_snapshot(
+            "online",
+            login_state="logged_in",
+            login_detail="WebUI 检测到 QQ 已登录: NapCatBot (123456789)。",
+            user_id="123456789",
+            nickname="NapCatBot",
+        )
+
+        await plugin._handle_login_transition_notifications(
+            previous_snapshot,
+            current_snapshot,
+            "2026-03-24 20:01:00",
+        )
+
+        self.assertEqual(context.send_message.await_count, 2)
+        message = context.send_message.await_args_list[0].args[1].get_plain_text()
+        self.assertIn("NapCat Keeper 检测到 QQ 已重新登录", message)
+        self.assertIn("NapCatBot (123456789)", message)
+        self.assertIn("WebUI 检测到 QQ 已登录", message)
+
+    async def test_handle_login_transition_notifications_skips_first_snapshot(self):
+        context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))
+        plugin = self.make_plugin(
+            {
+                "logout_notify_umos": ["platform:1"],
+                "relogin_notify_umos": ["platform:2"],
+            },
+            context=context,
+        )
+        plugin._log = lambda *args, **kwargs: None
+
+        current_snapshot = self.make_snapshot(
+            "online",
+            login_state="logged_in",
+            login_detail="WebUI 检测到 QQ 已登录: NapCatBot (123456789)。",
+            user_id="123456789",
+            nickname="NapCatBot",
+        )
+
+        await plugin._handle_login_transition_notifications(
+            None,
+            current_snapshot,
+            "2026-03-24 20:02:00",
+        )
+
+        self.assertEqual(context.send_message.await_count, 0)
+
+    async def test_handle_login_transition_notifications_skips_unchanged_or_service_error_state(self):
+        context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))
+        plugin = self.make_plugin(
+            {
+                "logout_notify_umos": ["platform:1"],
+                "relogin_notify_umos": ["platform:2"],
+            },
+            context=context,
+        )
+        plugin._log = lambda *args, **kwargs: None
+
+        previous_logged_in = self.make_snapshot(
+            "online",
+            login_state="logged_in",
+            login_detail="WebUI 检测到 QQ 已登录: NapCatBot (123456789)。",
+            user_id="123456789",
+            nickname="NapCatBot",
+        )
+        current_logged_in = self.make_snapshot(
+            "online",
+            login_state="logged_in",
+            login_detail="WebUI 检测到 QQ 已登录: NapCatBot (123456789)。",
+            user_id="123456789",
+            nickname="NapCatBot",
+        )
+        current_service_error = self.make_snapshot(
+            "error",
+            service_state="error",
+            service_detail="连接失败: connection refused",
+        )
+
+        await plugin._handle_login_transition_notifications(
+            previous_logged_in,
+            current_logged_in,
+            "2026-03-24 20:03:00",
+        )
+        await plugin._handle_login_transition_notifications(
+            previous_logged_in,
+            current_service_error,
+            "2026-03-24 20:04:00",
+        )
+
+        self.assertEqual(context.send_message.await_count, 0)
 
     async def test_initialize_starts_monitor_task_without_waiting_for_astrbot_loaded(self):
         plugin = self.make_plugin()
