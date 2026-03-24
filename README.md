@@ -109,6 +109,100 @@ git clone https://github.com/JackZhaoooooo/astrbot_plugin_napcat_keeper.git
 }
 ```
 
+## 自带 Flask 接收示例
+
+仓库内已附带一个最小可用的 Flask 接收器：
+
+`examples/webhook_receiver_flask.py`
+
+### 1. 安装 Flask
+
+```bash
+pip install flask
+```
+
+### 2. 启动接收器
+
+在插件仓库目录下运行：
+
+```bash
+python examples/webhook_receiver_flask.py
+```
+
+默认监听地址：
+
+```text
+http://0.0.0.0:8787/napcat-webhook
+```
+
+默认日志文件：
+
+```text
+napcat_webhook_receiver.log
+```
+
+也可以通过环境变量修改：
+
+```bash
+NAPCAT_WEBHOOK_HOST=0.0.0.0 \
+NAPCAT_WEBHOOK_PORT=8787 \
+NAPCAT_WEBHOOK_LOG_FILE=/root/napcat_webhook_receiver.log \
+python examples/webhook_receiver_flask.py
+```
+
+### 3. 在插件配置中填写 Webhook
+
+如果 Flask 接收器和 AstrBot 在同一台机器上，可以这样填：
+
+```json
+{
+  "logout_notify_webhooks": [
+    "http://127.0.0.1:8787/napcat-webhook"
+  ],
+  "relogin_notify_webhooks": [
+    "http://127.0.0.1:8787/napcat-webhook"
+  ]
+}
+```
+
+如果接收器部署在其他机器上，把 `127.0.0.1` 换成对应服务器 IP 或域名。
+
+### 4. 手动测试
+
+先确认接收器健康检查正常：
+
+```bash
+curl http://127.0.0.1:8787/healthz
+```
+
+再手动模拟一条退出登录通知：
+
+```bash
+curl -X POST http://127.0.0.1:8787/napcat-webhook \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "plugin": "NapcatKeeper",
+    "event": "logout",
+    "time": "2026-03-24 23:00:00",
+    "account": {
+      "user_id": "123456789",
+      "nickname": "NapCatBot",
+      "display": "NapCatBot (123456789)"
+    },
+    "status": {
+      "previous_login_state": "logged_in",
+      "current_login_state": "not_logged_in",
+      "current_overall_status": "offline"
+    },
+    "message": "NapCat Keeper 检测到 QQ 已退出登录"
+  }'
+```
+
+成功后你会看到：
+
+- 终端打印一行接收日志
+- `napcat_webhook_receiver.log` 追加一条 JSON 记录
+
 ## 兼容性
 
 - AstrBot 版本: >= 4.16
