@@ -1,0 +1,8 @@
+name: astrbot_plugin_napcat_keeper
+version: 1.0.0
+author: AstrBot Community
+description: NapCat QQ 机器人保活插件，检测并自动恢复掉线状态
+repository: https://github.com/your-repo/astrbot_plugin_napcat_keeper
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.16"
