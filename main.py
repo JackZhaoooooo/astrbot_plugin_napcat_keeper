@@ -7,7 +7,9 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -24,6 +26,7 @@ LOG_FILE = "/root/AstrBot/logs/napcat_keeper.log"
 FILE_LOGGER_NAME = "astrbot_plugin_napcat_keeper.file"
 SUCCESS_HTTP_CODES = {200, 301, 302, 303, 307, 308}
 WEBUI_SUCCESS_CODES = {0, "0"}
+WEBUI_CREDENTIAL_CACHE_TTL_SECONDS = 300
 RECOVERY_SERVICE_READY_TIMEOUT_SECONDS = 15
 RECOVERY_SERVICE_READY_POLL_SECONDS = 1
 RECOVERY_VERIFY_INTERVAL_SECONDS = 2
@@ -138,6 +141,8 @@ class NapcatKeeperPlugin(Star):
         self._login_info = None
         self._check_count = 0
         self._last_snapshot = None
+        self._webui_credential = None
+        self._webui_credential_cached_at = 0.0
 
         self._log("=" * 50)
         self._log("NapcatKeeper 插件初始化")
@@ -333,8 +338,43 @@ class NapcatKeeperPlugin(Star):
             "already login",
             "already logged",
             "已登录",
+            "无法重复登录",
+            "cannot login again",
+            "already online",
         ]
         return any(keyword in lowered for keyword in keywords)
+
+    @staticmethod
+    def _looks_like_rate_limited(message: str | None) -> bool:
+        if not message:
+            return False
+        lowered = message.lower()
+        keywords = [
+            "rate limit",
+            "too many",
+            "too frequent",
+            "频率",
+            "限流",
+            "过于频繁",
+        ]
+        return any(keyword in lowered for keyword in keywords)
+
+    @staticmethod
+    def _extract_user_id_from_text(message: str | None) -> str | None:
+        if not message:
+            return None
+
+        patterns = [
+            r"账号[\(\（]?(\d{5,})[\)\）]?",
+            r"uin[\s:=]+(\d{5,})",
+            r"qq[\s:=]+(\d{5,})",
+            r"\b(\d{5,})\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
 
     @staticmethod
     def _is_webui_success(payload: dict[str, Any] | None) -> bool:
@@ -399,10 +439,20 @@ class NapcatKeeperPlugin(Star):
         self,
         *,
         session: aiohttp.ClientSession | None = None,
+        force_refresh: bool = False,
     ) -> str:
         token = (self.napcat_token or "").strip()
         if not token:
             raise ValueError("未配置 napcat_token，无法向 NapCat WebUI 申请凭证。")
+
+        cached_credential = self._webui_credential
+        if (
+            not force_refresh
+            and cached_credential
+            and time.monotonic() - self._webui_credential_cached_at
+            < WEBUI_CREDENTIAL_CACHE_TTL_SECONDS
+        ):
+            return cached_credential
 
         endpoint = self._build_webui_api_url("/auth/login")
         created_session = session is None
@@ -422,14 +472,31 @@ class NapcatKeeperPlugin(Star):
 
         if payload is None:
             response_text = raw_text or f"HTTP {status_code}"
+            if cached_credential and self._looks_like_rate_limited(response_text):
+                self._log(
+                    "NapCat WebUI 鉴权触发限流，继续复用已缓存 Credential。",
+                    "WARNING",
+                )
+                return cached_credential
             raise RuntimeError(
                 "NapCat WebUI 鉴权接口返回了非 JSON 响应。"
                 f" | 接口: {endpoint} | 响应: {response_text}"
             )
 
         if not self._is_webui_success(payload):
+            rate_limit_detail = self._build_webui_error_detail(
+                "NapCat WebUI 鉴权失败",
+                payload,
+                raw_text,
+            )
+            if cached_credential and self._looks_like_rate_limited(rate_limit_detail):
+                self._log(
+                    "NapCat WebUI 鉴权触发限流，继续复用已缓存 Credential。",
+                    "WARNING",
+                )
+                return cached_credential
             raise RuntimeError(
-                f"{self._build_webui_error_detail('NapCat WebUI 鉴权失败', payload, raw_text)}"
+                f"{rate_limit_detail}"
                 f" | 接口: {endpoint} | HTTP {status_code}"
             )
 
@@ -439,6 +506,8 @@ class NapcatKeeperPlugin(Star):
             raise RuntimeError(
                 f"NapCat WebUI 鉴权成功，但未返回 Credential。 | 接口: {endpoint}"
             )
+        self._webui_credential = credential
+        self._webui_credential_cached_at = time.monotonic()
         return credential
 
     async def _call_webui_api(
@@ -967,11 +1036,28 @@ class NapcatKeeperPlugin(Star):
                 is_login = status_data.get("isLogin") is True
                 is_offline = status_data.get("isOffline") is True
                 login_error = status_data.get("loginError")
+                login_error_text = (
+                    str(login_error).strip()
+                    if login_error not in (None, "")
+                    else None
+                )
+
+                if not is_login and self._looks_like_already_logged_in(login_error_text):
+                    inferred_user_id = (
+                        self._extract_user_id_from_text(login_error_text)
+                        or self._normalize_user_id(self.qq_account)
+                    )
+                    return LoginCheckResult(
+                        state="logged_in",
+                        endpoint=status_endpoint,
+                        detail=f"WebUI 返回已登录提示: {login_error_text}",
+                        user_id=inferred_user_id,
+                    )
 
                 if not is_login and not is_offline:
                     detail = "WebUI 检测到当前未登录 QQ。"
-                    if login_error not in (None, ""):
-                        detail = f"WebUI 检测到当前未登录 QQ: {str(login_error).strip()}"
+                    if login_error_text:
+                        detail = f"WebUI 检测到当前未登录 QQ: {login_error_text}"
                     return LoginCheckResult(
                         state="not_logged_in",
                         endpoint=status_endpoint,

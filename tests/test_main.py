@@ -176,6 +176,54 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
             "32250170a0dca92d53ec9624f336ca24",
         )
 
+    async def test_request_webui_credential_reuses_cached_credential(self):
+        plugin = self.make_plugin({"napcat_token": "token123"})
+        plugin._post_json_request = AsyncMock(
+            return_value=(
+                200,
+                {
+                    "code": 0,
+                    "message": "success",
+                    "data": {"Credential": "credential-123"},
+                },
+                None,
+            )
+        )
+
+        first = await plugin._request_webui_credential(session=object())
+        second = await plugin._request_webui_credential(session=object())
+
+        self.assertEqual(first, "credential-123")
+        self.assertEqual(second, "credential-123")
+        self.assertEqual(plugin._post_json_request.await_count, 1)
+
+    async def test_request_webui_credential_reuses_cached_value_when_auth_rate_limited(self):
+        plugin = self.make_plugin({"napcat_token": "token123"})
+        plugin._webui_credential = "cached-credential"
+        plugin._webui_credential_cached_at = 0.0
+        plugin._post_json_request = AsyncMock(
+            return_value=(
+                200,
+                {
+                    "code": 1,
+                    "message": "login rate limit",
+                    "data": None,
+                },
+                None,
+            )
+        )
+        plugin._log = lambda *args, **kwargs: None
+
+        with patch.object(
+            self.module.time,
+            "monotonic",
+            return_value=self.module.WEBUI_CREDENTIAL_CACHE_TTL_SECONDS + 1000,
+        ):
+            credential = await plugin._request_webui_credential(session=object())
+
+        self.assertEqual(credential, "cached-credential")
+        self.assertEqual(plugin._post_json_request.await_count, 1)
+
     def test_emit_snapshot_logs_are_clear(self):
         plugin = self.make_plugin()
         plugin._check_count = 7
@@ -512,6 +560,37 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.user_id, "123456789")
         self.assertEqual(result.nickname, "NapCatBot")
         self.assertIn("WebUI 检测到 QQ 已登录", result.detail)
+
+    async def test_check_qq_login_status_via_webui_treats_already_logged_in_message_as_logged_in(self):
+        plugin = self.make_plugin(
+            {
+                "napcat_token": "token123",
+                "qq_account": "3412404961",
+            }
+        )
+        plugin._request_webui_credential = AsyncMock(return_value="credential-123")
+        plugin._call_webui_api = AsyncMock(
+            return_value=(
+                plugin._build_webui_api_url("/QQLogin/CheckLoginStatus"),
+                200,
+                {
+                    "code": 0,
+                    "message": "success",
+                    "data": {
+                        "isLogin": False,
+                        "isOffline": False,
+                        "loginError": "当前账号(3412404961)已登录,无法重复登录",
+                    },
+                },
+                None,
+            )
+        )
+
+        result = await plugin._check_qq_login_status_via_webui()
+
+        self.assertEqual(result.state, "logged_in")
+        self.assertEqual(result.user_id, "3412404961")
+        self.assertIn("WebUI 返回已登录提示", result.detail)
 
     async def test_check_qq_login_status_falls_back_to_legacy_when_webui_fails(self):
         plugin = self.make_plugin()
