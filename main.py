@@ -31,7 +31,6 @@ RECOVERY_SERVICE_READY_TIMEOUT_SECONDS = 15
 RECOVERY_SERVICE_READY_POLL_SECONDS = 1
 RECOVERY_VERIFY_INTERVAL_SECONDS = 2
 RECOVERY_VERIFY_ATTEMPTS_WITH_AUTO_LOGIN = 8
-RECOVERY_VERIFY_ATTEMPTS_LOGIN_ONLY = 6
 RECOVERY_VERIFY_ATTEMPTS_DEFAULT = 4
 STATUS_TEXT = {
     "online": "🟢 在线",
@@ -257,6 +256,9 @@ class NapcatKeeperPlugin(Star):
             "手动处理",
             "manual",
             "captcha",
+            "无法重复登录",
+            "其他位置登录",
+            "其他设备登录",
         ]
         return any(keyword in lowered for keyword in keywords)
 
@@ -338,8 +340,6 @@ class NapcatKeeperPlugin(Star):
             "already login",
             "already logged",
             "已登录",
-            "无法重复登录",
-            "cannot login again",
             "already online",
         ]
         return any(keyword in lowered for keyword in keywords)
@@ -691,13 +691,16 @@ class NapcatKeeperPlugin(Star):
         return f"NapCat 服务异常: {snapshot.service.detail}"
 
     @staticmethod
-    def _should_use_login_only_recovery(snapshot: StatusSnapshot | None) -> bool:
-        return bool(
-            snapshot
-            and snapshot.service.state == "online"
-            and snapshot.login is not None
-            and snapshot.login.state != "logged_in"
-        )
+    def _looks_like_duplicate_login_conflict(message: str | None) -> bool:
+        if not message:
+            return False
+        lowered = message.lower()
+        keywords = [
+            "无法重复登录",
+            "cannot login again",
+            "duplicate login",
+        ]
+        return any(keyword in lowered for keyword in keywords)
 
     @staticmethod
     def _notification_login_state(snapshot: StatusSnapshot | None) -> str | None:
@@ -881,17 +884,12 @@ class NapcatKeeperPlugin(Star):
                         self.enable_auto_restart
                         and self._consecutive_failures >= self.max_retries
                     ):
-                        recovery_action = (
-                            "QQ 重新登录恢复"
-                            if self._should_use_login_only_recovery(snapshot)
-                            else "NapCat 全量恢复"
-                        )
                         self._log(
-                            f"[{current_time}] 连续失败达到阈值，开始执行{recovery_action}... "
+                            f"[{current_time}] 连续失败达到阈值，开始执行 NapCat 全量恢复... "
                             f"| 触发原因: {failure_reason}",
-                            "WARNING" if recovery_action == "QQ 重新登录恢复" else "ERROR",
+                            "ERROR",
                         )
-                        await self._recover_for_snapshot(snapshot)
+                        await self._recover_napcat()
                         self._consecutive_failures = 0
 
             except Exception as e:
@@ -1042,26 +1040,21 @@ class NapcatKeeperPlugin(Star):
                     else None
                 )
 
-                if not is_login and self._looks_like_already_logged_in(login_error_text):
-                    inferred_user_id = (
-                        self._extract_user_id_from_text(login_error_text)
-                        or self._normalize_user_id(self.qq_account)
-                    )
-                    return LoginCheckResult(
-                        state="logged_in",
-                        endpoint=status_endpoint,
-                        detail=f"WebUI 返回已登录提示: {login_error_text}",
-                        user_id=inferred_user_id,
-                    )
-
                 if not is_login and not is_offline:
                     detail = "WebUI 检测到当前未登录 QQ。"
+                    inferred_user_id = None
                     if login_error_text:
                         detail = f"WebUI 检测到当前未登录 QQ: {login_error_text}"
+                        if self._looks_like_duplicate_login_conflict(login_error_text):
+                            inferred_user_id = (
+                                self._extract_user_id_from_text(login_error_text)
+                                or self._normalize_user_id(self.qq_account)
+                            )
                     return LoginCheckResult(
                         state="not_logged_in",
                         endpoint=status_endpoint,
                         detail=detail,
+                        user_id=inferred_user_id,
                     )
 
                 (
@@ -1220,6 +1213,13 @@ class NapcatKeeperPlugin(Star):
 
         login_message = self._extract_webui_message(login_payload)
         if not self._is_webui_success(login_payload):
+            if self._looks_like_duplicate_login_conflict(login_message):
+                return (
+                    False,
+                    "快速登录未成功，当前 QQ 账号已在其他位置登录，"
+                    "NapCat 端尚未完成登录。"
+                    f" | 原始响应: {login_message} | 接口: {login_endpoint}",
+                )
             if self._looks_like_already_logged_in(login_message):
                 return (
                     True,
@@ -1269,6 +1269,13 @@ class NapcatKeeperPlugin(Star):
 
         message = self._extract_webui_message(payload)
         if not self._is_webui_success(payload):
+            if self._looks_like_duplicate_login_conflict(message):
+                return (
+                    False,
+                    "QQ 密码登录未成功，当前 QQ 账号已在其他位置登录，"
+                    "NapCat 端尚未完成登录。"
+                    f" | 原始响应: {message} | 接口: {endpoint}",
+                )
             if self._looks_like_already_logged_in(message):
                 return (
                     True,
@@ -1524,77 +1531,13 @@ class NapcatKeeperPlugin(Star):
         return snapshot.overall_status
 
     async def _recover_for_snapshot(self, snapshot: StatusSnapshot | None = None):
-        if snapshot is None:
-            snapshot = await self._collect_status_snapshot()
-
-        if self._should_use_login_only_recovery(snapshot):
-            self._log("NapCat 服务正常，优先执行 QQ 重新登录恢复。")
-            await self._recover_login_only()
-            return
-
         await self._recover_napcat()
-
-    async def _recover_login_only(self):
-        """NapCat 服务正常时，仅执行 QQ 重新登录恢复。"""
-        self._last_restart_time = datetime.now()
-        self._log("=" * 50)
-        self._log("开始执行 QQ 重新登录恢复")
-        self._log("=" * 50)
-
-        try:
-            self._log("[1/2] 提交 QQ 重新登录请求...")
-            auto_login_result = await self._auto_login_qq()
-            if auto_login_result.submitted:
-                self._log(
-                    "[1/2] ✓ QQ 重新登录请求已提交。"
-                    f" | 结果: {auto_login_result.detail}"
-                )
-            else:
-                self._log(
-                    "[1/2] QQ 重新登录未成功。"
-                    f" | 原因: {auto_login_result.detail}",
-                    "WARNING" if auto_login_result.level != "ERROR" else "ERROR",
-                )
-
-            verify_attempts = self._resolve_verify_attempts(
-                auto_login_result,
-                default_attempts=RECOVERY_VERIFY_ATTEMPTS_LOGIN_ONLY,
-            )
-            if auto_login_result.manual_action_required:
-                self._log(
-                    "[2/2] 检测到 QQ 重新登录失败原因需要人工处理，"
-                    "跳过重复快速重试，直接输出当前状态。",
-                    "WARNING",
-                )
-            self._log(
-                "[2/2] 开始快速验证重新登录结果 "
-                f"(最多 {verify_attempts} 次，每 {RECOVERY_VERIFY_INTERVAL_SECONDS} 秒一次)..."
-            )
-            snapshot = await self._verify_recovery_status(
-                max_attempts=verify_attempts,
-                interval_seconds=RECOVERY_VERIFY_INTERVAL_SECONDS,
-            )
-
-            if snapshot.overall_status == "online":
-                self._log("=" * 50)
-                self._log("✓ QQ 重新登录恢复成功!")
-                self._log("=" * 50)
-                return
-
-            final_level = "WARNING" if snapshot.overall_status == "offline" else "ERROR"
-            self._log(
-                "QQ 重新登录后综合状态: "
-                f"{STATUS_TEXT.get(snapshot.overall_status, snapshot.overall_status)}"
-                f" | 原因: {self._snapshot_failure_reason(snapshot)}"
-                f" | 自动登录结果: {auto_login_result.detail}",
-                final_level,
-            )
-        except Exception as e:
-            self._log(f"QQ 重新登录恢复失败: {e}", "ERROR", exc_info=True)
 
     async def _recover_napcat(self):
         """恢复 NapCat。"""
         self._last_restart_time = datetime.now()
+        self._webui_credential = None
+        self._webui_credential_cached_at = 0.0
         self._log("=" * 50)
         self._log("开始恢复 NapCat")
         self._log("=" * 50)
@@ -1806,13 +1749,8 @@ class NapcatKeeperPlugin(Star):
     async def cmd_recover(self, event: AstrMessageEvent):
         """手动恢复 NapCat。"""
         try:
-            snapshot = await self._collect_status_snapshot()
-            if self._should_use_login_only_recovery(snapshot):
-                yield event.plain_result("🔄 NapCat 服务正常，正在执行 QQ 重新登录恢复，请稍候...")
-            else:
-                yield event.plain_result("🔄 正在恢复 NapCat，请稍候...")
-
-            await self._recover_for_snapshot(snapshot)
+            yield event.plain_result("🔄 正在恢复 NapCat，请稍候...")
+            await self._recover_napcat()
             status = await self._check_napcat_status()
 
             if status == "online":
