@@ -8,9 +8,7 @@ import aiohttp
 import subprocess
 import os
 import json
-import hashlib
 from datetime import datetime
-from pathlib import Path
 
 from astrbot.api.star import Context, Star
 from astrbot.api.event import filter, AstrMessageEvent
@@ -37,7 +35,7 @@ class NapcatKeeper(Star):
         self.enable_auto_login = config.get("enable_auto_login", True)
         self.notify_on_restart = config.get("notify_on_restart", True)
         
-        # 账号配置（用于自动登录）
+        # 账号配置
         self.qq_account = config.get("qq_account", "")
         self.qq_password = config.get("qq_password", "")
         
@@ -47,10 +45,12 @@ class NapcatKeeper(Star):
         self._monitor_task = None
         self._last_restart_time = None
         self._login_info = None
+        self._check_count = 0  # 检测次数计数器
         
         logger.info(f"[NapcatKeeper] 插件初始化完成")
         logger.info(f"[NapcatKeeper] NapCat URL: {self.napcat_url}")
         logger.info(f"[NapcatKeeper] 检查间隔: {self.check_interval}秒")
+        logger.info(f"[NapcatKeeper] 自动恢复: {'启用' if self.enable_auto_restart else '禁用'}")
         logger.info(f"[NapcatKeeper] 自动登录: {'启用' if self.enable_auto_login else '禁用'}")
     
     async def on_astrbot_loaded(self):
@@ -61,21 +61,39 @@ class NapcatKeeper(Star):
     
     async def _monitor_loop(self):
         """主监控循环"""
+        logger.info(f"[NapcatKeeper] 监控循环已启动，每 {self.check_interval} 秒检测一次")
+        
         while self._is_monitoring:
             try:
+                self._check_count += 1
+                current_time = datetime.now().strftime("%H:%M:%S")
+                
+                # 每次检测都记录日志
+                logger.info(f"[NapcatKeeper] [{current_time}] 第 {self._check_count} 次检测...")
+                
                 status = await self._check_napcat_status()
                 
                 if status == "online":
+                    logger.info(f"[NapcatKeeper] [{current_time}] 状态: 🟢 在线")
                     if self._consecutive_failures > 0:
-                        logger.info(f"[NapcatKeeper] NapCat 状态恢复正常")
+                        logger.info(f"[NapcatKeeper] [{current_time}] 状态已恢复正常 (连续失败 {self._consecutive_failures} 次后恢复)")
                     self._consecutive_failures = 0
                     
-                elif status in ["offline", "error"]:
+                elif status == "offline":
                     self._consecutive_failures += 1
-                    logger.warning(f"[NapcatKeeper] NapCat 状态异常 (第 {self._consecutive_failures} 次)")
+                    logger.warning(f"[NapcatKeeper] [{current_time}] 状态: 🔴 掉线 (第 {self._consecutive_failures}/{self.max_retries} 次)")
                     
-                    if self._consecutive_failures >= self.max_retries:
-                        logger.error(f"[NapcatKeeper] 连续失败达到阈值，执行恢复...")
+                    if self.enable_auto_restart and self._consecutive_failures >= self.max_retries:
+                        logger.error(f"[NapcatKeeper] [{current_time}] 连续失败达到阈值，开始执行恢复...")
+                        await self._recover_napcat()
+                        self._consecutive_failures = 0
+                
+                elif status == "error":
+                    self._consecutive_failures += 1
+                    logger.error(f"[NapcatKeeper] [{current_time}] 状态: ⚠️ 连接错误 (第 {self._consecutive_failures}/{self.max_retries} 次)")
+                    
+                    if self.enable_auto_restart and self._consecutive_failures >= self.max_retries:
+                        logger.error(f"[NapcatKeeper] [{current_time}] 连续失败达到阈值，开始执行恢复...")
                         await self._recover_napcat()
                         self._consecutive_failures = 0
                         
@@ -95,7 +113,6 @@ class NapcatKeeper(Star):
                 headers["Authorization"] = f"Bearer {self.napcat_token}"
             
             async with aiohttp.ClientSession() as session:
-                # 尝试获取登录信息
                 async with session.post(
                     f"{self.napcat_url}/get_login_info",
                     json={},
@@ -106,14 +123,17 @@ class NapcatKeeper(Star):
                         data = await resp.json()
                         if data.get("status") == "ok" and data.get("retcode") == 0:
                             self._login_info = data.get("data", {})
+                            nickname = self._login_info.get('nickname', '未知')
+                            user_id = self._login_info.get('user_id', 'N/A')
+                            logger.debug(f"[NapcatKeeper] 登录信息: {nickname} ({user_id})")
                             return "online"
                         return "offline"
                     return "error"
         except asyncio.TimeoutError:
-            logger.warning("[NapcatKeeper] NapCat API 请求超时")
+            logger.warning("[NapcatKeeper] API 请求超时")
             return "error"
         except aiohttp.ClientError as e:
-            logger.warning(f"[NapcatKeeper] NapCat API 连接失败: {e}")
+            logger.warning(f"[NapcatKeeper] API 连接失败: {e}")
             return "error"
         except Exception as e:
             logger.error(f"[NapcatKeeper] 检查状态异常: {e}")
@@ -121,36 +141,41 @@ class NapcatKeeper(Star):
     
     async def _recover_napcat(self):
         """恢复 NapCat（重启+重登）"""
-        logger.info("[NapcatKeeper] 开始恢复 NapCat...")
+        self._last_restart_time = datetime.now()
+        logger.info("[NapcatKeeper] ========== 开始恢复 NapCat ==========")
         
         try:
             # 步骤1: 杀掉 QQ 进程
-            logger.info("[NapcatKeeper] 1/4 终止 QQ 进程...")
+            logger.info("[NapcatKeeper] [1/4] 终止 QQ 进程...")
             subprocess.run(["pkill", "-f", "qq"], stderr=subprocess.DEVNULL)
             await asyncio.sleep(2)
             subprocess.run(["pkill", "-9", "-f", "QQ"], stderr=subprocess.DEVNULL)
             await asyncio.sleep(1)
+            logger.info("[NapcatKeeper] [1/4] ✓ 进程已终止")
             
             # 步骤2: 清理残留状态
-            logger.info("[NapcatKeeper] 2/4 清理残留状态...")
+            logger.info("[NapcatKeeper] [2/4] 清理残留状态...")
             await self._clear_login_state()
+            logger.info("[NapcatKeeper] [2/4] ✓ 状态已清理")
             
             # 步骤3: 重新启动 NapCat
-            logger.info("[NapcatKeeper] 3/4 启动 NapCat...")
+            logger.info("[NapcatKeeper] [3/4] 启动 NapCat...")
             await self._start_napcat()
+            logger.info("[NapcatKeeper] [3/4] ✓ 启动命令已执行")
             
             # 步骤4: 等待并验证
-            logger.info("[NapcatKeeper] 4/4 等待 NapCat 启动...")
+            logger.info("[NapcatKeeper] [4/4] 等待 NapCat 启动 (15秒)...")
             await asyncio.sleep(15)
             
             # 检查是否恢复
             for i in range(3):
                 status = await self._check_napcat_status()
                 if status == "online":
-                    logger.info("[NapcatKeeper] ✓ NapCat 恢复成功!")
+                    logger.info("[NapcatKeeper] ========== ✓ NapCat 恢复成功! ==========")
                     if self.notify_on_restart:
                         await self._send_notification("✅ NapCat 已自动恢复！")
                     return
+                logger.info(f"[NapcatKeeper] [4/4] 等待验证... ({i+1}/3)")
                 await asyncio.sleep(5)
             
             logger.warning(f"[NapcatKeeper] NapCat 恢复后状态: {status}")
@@ -163,7 +188,6 @@ class NapcatKeeper(Star):
     async def _clear_login_state(self):
         """清理登录状态文件"""
         try:
-            # 清理可能的 token 缓存
             napcat_data_dir = os.path.join(self.napcat_dir, "app", ".config", "QQ")
             if os.path.exists(napcat_data_dir):
                 logger.info(f"[NapcatKeeper] 清理目录: {napcat_data_dir}")
@@ -181,6 +205,7 @@ class NapcatKeeper(Star):
                     stderr=subprocess.STDOUT,
                     start_new_session=True
                 )
+                logger.info(f"[NapcatKeeper] 使用启动脚本: {self.launcher_script}")
             else:
                 subprocess.Popen(
                     ["bash", "-c", f"cd {self.napcat_dir} && ./launcher.sh"],
@@ -188,6 +213,7 @@ class NapcatKeeper(Star):
                     stderr=subprocess.STDOUT,
                     start_new_session=True
                 )
+                logger.info(f"[NapcatKeeper] 使用备选启动: {self.napcat_dir}/launcher.sh")
         except Exception as e:
             logger.error(f"[NapcatKeeper] 启动 NapCat 失败: {e}")
     
@@ -236,6 +262,7 @@ class NapcatKeeper(Star):
                 f"🔗 地址: {self.napcat_url}\n"
                 f"📋 状态: {status_text}\n"
                 f"⏱️ 检查间隔: {self.check_interval}秒\n"
+                f"📊 已检测: {self._check_count} 次\n"
                 f"⚠️ 连续失败: {self._consecutive_failures}/{self.max_retries}\n"
                 f"🔧 自动恢复: {'启用' if self.enable_auto_restart else '禁用'}\n"
                 f"🔑 自动登录: {'启用' if self.enable_auto_login else '禁用'}"
@@ -273,9 +300,8 @@ class NapcatKeeper(Star):
             "/napcat_recover - 手动恢复 NapCat\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
             "💡 功能说明:\n"
-            "• 自动检测 NapCat 登录状态\n"
+            "• 每分钟自动检测登录状态\n"
             "• 掉线时自动重启恢复\n"
-            "• 支持配置检查间隔和重试阈值\n"
             "• 支持配置 QQ 账号密码实现自动登录"
         )
         yield event.plain_result(help_text)
