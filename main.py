@@ -123,6 +123,7 @@ class NapcatKeeperPlugin(Star):
         self.enable_auto_restart = config.get("enable_auto_restart", True)
         self.enable_auto_login = config.get("enable_auto_login", True)
         self.notify_on_restart = config.get("notify_on_restart", True)
+        self.debug_mode = self._parse_bool(config.get("debug", False), default=False)
 
         self.qq_account = config.get("qq_account", "")
         self.qq_password = config.get("qq_password", "")
@@ -148,6 +149,7 @@ class NapcatKeeperPlugin(Star):
         self._log(f"检查间隔: {self.check_interval}秒")
         self._log(f"自动恢复: {'启用' if self.enable_auto_restart else '禁用'}")
         self._log(f"自动登录: {'启用' if self.enable_auto_login else '禁用'}")
+        self._log(f"调试日志: {'启用' if self.debug_mode else '禁用'}")
         self._log(f"自动登录账号: {'已配置' if self.qq_account else '未配置'}")
         logout_notify_text = (
             f"退出登录通知: {len(self.logout_notify_umos)} 个 UMO"
@@ -244,6 +246,22 @@ class NapcatKeeperPlugin(Star):
     @classmethod
     def _normalize_umo_list(cls, raw_value: Any) -> list[str]:
         return cls._normalize_string_list(raw_value)
+
+    @staticmethod
+    def _parse_bool(raw_value: Any, *, default: bool) -> bool:
+        if isinstance(raw_value, bool):
+            return raw_value
+        if raw_value in (None, ""):
+            return default
+        if isinstance(raw_value, (int, float)):
+            return raw_value != 0
+
+        text = str(raw_value).strip().lower()
+        if text in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+        return default
 
     @staticmethod
     def _auto_login_requires_manual_action(detail: str | None) -> bool:
@@ -666,7 +684,26 @@ class NapcatKeeperPlugin(Star):
             f"登录状态: {login_text}"
         )
 
-    def _emit_snapshot_logs(self, current_time: str, snapshot: StatusSnapshot):
+    def _should_emit_snapshot_logs(
+        self,
+        snapshot: StatusSnapshot,
+        *,
+        force: bool = False,
+    ) -> bool:
+        if force or self.debug_mode:
+            return True
+        return snapshot.overall_status != "online"
+
+    def _emit_snapshot_logs(
+        self,
+        current_time: str,
+        snapshot: StatusSnapshot,
+        *,
+        force: bool = False,
+    ):
+        if not self._should_emit_snapshot_logs(snapshot, force=force):
+            return
+
         service_level = "INFO" if snapshot.service.state == "online" else "ERROR"
         self._log(self._format_service_log(current_time, snapshot.service), service_level)
 
@@ -1033,7 +1070,8 @@ class NapcatKeeperPlugin(Star):
             try:
                 self._check_count += 1
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self._log(f"[{current_time}] 开始巡检...")
+                if self.debug_mode:
+                    self._log(f"[{current_time}] 开始巡检...")
 
                 previous_snapshot = self._last_snapshot
                 snapshot = await self._collect_status_snapshot()
@@ -1645,7 +1683,7 @@ class NapcatKeeperPlugin(Star):
             snapshot = await self._collect_status_snapshot()
             last_snapshot = snapshot
             verify_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self._emit_snapshot_logs(verify_time, snapshot)
+            self._emit_snapshot_logs(verify_time, snapshot, force=True)
 
             if snapshot.overall_status == "online":
                 return snapshot

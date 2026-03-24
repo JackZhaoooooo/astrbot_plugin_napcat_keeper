@@ -77,6 +77,12 @@
         },
         "default": []
     },
+    "debug": {
+        "description": "调试日志",
+        "type": "bool",
+        "hint": "开启后输出全部巡检日志；关闭后默认隐藏正常在线的轮询日志，但保留恢复和重新登录过程日志",
+        "default": false
+    },
     "notify_on_restart": {
         "description": "恢复后发送通知",
         "type": "bool",

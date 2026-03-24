@@ -275,6 +275,94 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[2][0], "WARNING")
         self.assertNotIn("第 7 次检查 -", captured[2][1])
 
+    def test_emit_snapshot_logs_skips_online_polling_when_debug_disabled(self):
+        plugin = self.make_plugin()
+        snapshot = self.module.StatusSnapshot(
+            overall_status="online",
+            service=self.module.ServiceCheckResult(
+                state="online",
+                checked_url="http://localhost:6099",
+                status_code=200,
+                detail="HTTP 200，NapCat 服务可达。",
+            ),
+            login=self.module.LoginCheckResult(
+                state="logged_in",
+                endpoint="http://localhost:6099/api/QQLogin/CheckLoginStatus",
+                detail="WebUI 检测到 QQ 已登录: NapCatBot (123456789)。",
+                user_id="123456789",
+                nickname="NapCatBot",
+            ),
+        )
+
+        captured = []
+        plugin._log = lambda message, level="INFO", **kwargs: captured.append(
+            (level, message, kwargs)
+        )
+
+        plugin._emit_snapshot_logs("2026-03-24 18:00:00", snapshot)
+
+        self.assertEqual(captured, [])
+
+    def test_emit_snapshot_logs_outputs_online_polling_when_debug_enabled(self):
+        plugin = self.make_plugin({"debug": True})
+        snapshot = self.module.StatusSnapshot(
+            overall_status="online",
+            service=self.module.ServiceCheckResult(
+                state="online",
+                checked_url="http://localhost:6099",
+                status_code=200,
+                detail="HTTP 200，NapCat 服务可达。",
+            ),
+            login=self.module.LoginCheckResult(
+                state="logged_in",
+                endpoint="http://localhost:6099/api/QQLogin/CheckLoginStatus",
+                detail="WebUI 检测到 QQ 已登录: NapCatBot (123456789)。",
+                user_id="123456789",
+                nickname="NapCatBot",
+            ),
+        )
+
+        captured = []
+        plugin._log = lambda message, level="INFO", **kwargs: captured.append(
+            (level, message, kwargs)
+        )
+
+        plugin._emit_snapshot_logs("2026-03-24 18:00:00", snapshot)
+
+        self.assertEqual(len(captured), 3)
+        self.assertTrue(any("NapCat 服务检测" in item[1] for item in captured))
+        self.assertTrue(any("QQ 登录检测" in item[1] for item in captured))
+        self.assertTrue(any("综合判定" in item[1] for item in captured))
+
+    def test_emit_snapshot_logs_force_outputs_online_polling_for_recovery(self):
+        plugin = self.make_plugin()
+        snapshot = self.module.StatusSnapshot(
+            overall_status="online",
+            service=self.module.ServiceCheckResult(
+                state="online",
+                checked_url="http://localhost:6099",
+                status_code=200,
+                detail="HTTP 200，NapCat 服务可达。",
+            ),
+            login=self.module.LoginCheckResult(
+                state="logged_in",
+                endpoint="http://localhost:6099/api/QQLogin/CheckLoginStatus",
+                detail="WebUI 检测到 QQ 已登录: NapCatBot (123456789)。",
+                user_id="123456789",
+                nickname="NapCatBot",
+            ),
+        )
+
+        captured = []
+        plugin._log = lambda message, level="INFO", **kwargs: captured.append(
+            (level, message, kwargs)
+        )
+
+        plugin._emit_snapshot_logs("2026-03-24 18:00:00", snapshot, force=True)
+
+        self.assertEqual(len(captured), 3)
+        self.assertTrue(any("综合判定" in item[1] for item in captured))
+
     def test_normalize_umo_list_supports_multiple_formats_and_deduplicates(self):
         result = self.module.NapcatKeeperPlugin._normalize_umo_list(
             [
