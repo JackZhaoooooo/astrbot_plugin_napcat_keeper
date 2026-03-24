@@ -204,10 +204,13 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured), 3)
         self.assertEqual(captured[0][0], "INFO")
         self.assertIn("NapCat 服务检测", captured[0][1])
+        self.assertNotIn("第 7 次检查 -", captured[0][1])
         self.assertIn("QQ 登录检测", captured[1][1])
         self.assertEqual(captured[1][0], "WARNING")
+        self.assertNotIn("第 7 次检查 -", captured[1][1])
         self.assertIn("综合判定", captured[2][1])
         self.assertEqual(captured[2][0], "WARNING")
+        self.assertNotIn("第 7 次检查 -", captured[2][1])
 
     def test_normalize_umo_list_supports_multiple_formats_and_deduplicates(self):
         result = self.module.NapcatKeeperPlugin._normalize_umo_list(

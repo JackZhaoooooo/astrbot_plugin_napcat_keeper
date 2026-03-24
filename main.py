@@ -525,7 +525,7 @@ class NapcatKeeperPlugin(Star):
             else "无 HTTP 响应"
         )
         return (
-            f"[{current_time}] 第 {self._check_count} 次检查 - NapCat 服务检测: "
+            f"[{current_time}] NapCat 服务检测: "
             f"{self._service_state_text(service.state)} | 地址: {service.checked_url} | "
             f"响应: {http_text} | 说明: {service.detail}"
         )
@@ -533,7 +533,7 @@ class NapcatKeeperPlugin(Star):
     def _format_login_log(self, current_time: str, login: LoginCheckResult | None) -> str:
         if login is None:
             return (
-                f"[{current_time}] 第 {self._check_count} 次检查 - QQ 登录检测: "
+                f"[{current_time}] QQ 登录检测: "
                 "⚪ 已跳过 | 原因: NapCat 服务不可达，未执行登录态检查。"
             )
 
@@ -543,7 +543,7 @@ class NapcatKeeperPlugin(Star):
             else "未识别到登录账号"
         )
         return (
-            f"[{current_time}] 第 {self._check_count} 次检查 - QQ 登录检测: "
+            f"[{current_time}] QQ 登录检测: "
             f"{self._login_state_text(login.state)} | 接口: {login.endpoint} | "
             f"账号: {account_text} | 说明: {login.detail}"
         )
@@ -557,7 +557,7 @@ class NapcatKeeperPlugin(Star):
             else "⚪ 已跳过"
         )
         return (
-            f"[{current_time}] 第 {self._check_count} 次检查 - 综合判定: "
+            f"[{current_time}] 综合判定: "
             f"{STATUS_TEXT.get(snapshot.overall_status, '❓ 未知')} | "
             f"服务状态: {self._service_state_text(snapshot.service.state)} | "
             f"登录状态: {login_text}"
@@ -740,7 +740,7 @@ class NapcatKeeperPlugin(Star):
             try:
                 self._check_count += 1
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self._log(f"[{current_time}] 第 {self._check_count} 次检查 - 开始巡检...")
+                self._log(f"[{current_time}] 开始巡检...")
 
                 previous_snapshot = self._last_snapshot
                 snapshot = await self._collect_status_snapshot()
