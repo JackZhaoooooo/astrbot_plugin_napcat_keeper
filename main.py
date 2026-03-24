@@ -74,6 +74,7 @@ class NapcatKeeper(Star):
         # 同时输出到 AstrBot 日志
         logger.info(f"[NapcatKeeper] 插件初始化完成")
     
+    @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
         """AstrBot 加载完成后启动监控"""
         plugin_logger.info("AstrBot 加载完成，启动 NapCat 保活监控...")
