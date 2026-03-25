@@ -1,64 +1,41 @@
 {
-  "napcat_url": {
-    "description": "NapCat 根地址",
-    "type": "string",
-    "hint": "默认 http://127.0.0.1:6099",
-    "default": "http://127.0.0.1:6099"
-  },
-  "napcat_token": {
-    "description": "NapCat WebUI Token",
-    "type": "string",
-    "hint": "用于 /api/auth/login 鉴权",
-    "default": ""
-  },
-  "qq_account": {
-    "description": "目标 QQ 号",
-    "type": "string",
-    "hint": "用于账号密码登录",
-    "default": ""
-  },
-  "qq_password": {
-    "description": "目标 QQ 密码",
-    "type": "string",
-    "hint": "明文配置，提交时转 md5",
-    "default": ""
-  },
-  "enable_auto_login": {
-    "description": "是否启用自动重登",
-    "type": "bool",
-    "default": true
-  },
-  "check_interval_seconds": {
-    "description": "状态轮询间隔（秒）",
-    "type": "int",
-    "default": 20,
-    "minimum": 5
-  },
-  "request_timeout_seconds": {
-    "description": "HTTP 请求超时（秒）",
-    "type": "int",
-    "default": 10,
-    "minimum": 3
-  },
-  "qr_refresh_interval_seconds": {
-    "description": "二维码刷新间隔（秒）",
-    "type": "int",
-    "default": 120,
-    "minimum": 30
-  },
-  "umo_ids_for_qr": {
-    "description": "二维码通知目标 UMO 列表，支持逗号/换行分隔",
-    "type": "string",
-    "default": ""
-  },
-  "cache_dir": {
-    "description": "插件缓存目录（二维码图片）",
-    "type": "string",
-    "default": ""
-  },
-  "debug": {
-    "description": "是否输出调试日志",
-    "type": "bool",
-    "default": false
-  }
+    "napcat_url": {
+        "description": "NapCat 地址",
+        "type": "string",
+        "hint": "默认: http://localhost:6099",
+        "default": "http://localhost:6099"
+    },
+    "napcat_token": {
+        "description": "NapCat 接口 Token",
+        "type": "string",
+        "hint": "可选，填写后会附带 Bearer Token 请求头",
+        "default": ""
+    },
+    "check_interval": {
+        "description": "检查间隔（秒）",
+        "type": "int",
+        "hint": "最小 5 秒，默认 30 秒",
+        "default": 30
+    },
+    "request_timeout_seconds": {
+        "description": "请求超时（秒）",
+        "type": "int",
+        "hint": "最小 3 秒，默认 10 秒",
+        "default": 10
+    },
+    "notify_umos": {
+        "description": "退出登录通知 UMO 列表",
+        "type": "list",
+        "hint": "可填写多个 UMO，检测到退出登录时逐个通知",
+        "items": {
+            "type": "string"
+        },
+        "default": []
+    },
+    "debug": {
+        "description": "输出全部轮询日志",
+        "type": "bool",
+        "hint": "关闭后仅在状态变化、告警和异常时写日志",
+        "default": false
+    }
 }

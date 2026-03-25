@@ -1,1 +1,3 @@
-from .main import NapcatKeeperPlugin
+"""
+NapCat 登录状态监控插件
+"""
