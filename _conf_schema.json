@@ -6,10 +6,16 @@
         "default": "http://localhost:6099"
     },
     "napcat_token": {
-        "description": "NapCat 接口 Token",
+        "description": "NapCat WebUI Token",
         "type": "string",
-        "hint": "可选，填写后会附带 Bearer Token 请求头",
+        "hint": "可选；优先使用该 token 进行 WebUI 鉴权。留空时会尝试从本地 webui.json 自动读取",
         "default": ""
+    },
+    "webui_config_path": {
+        "description": "本地 WebUI 配置路径",
+        "type": "string",
+        "hint": "仅在未填写 napcat_token 时使用，默认: /root/AstrBot/napcat/config/webui.json",
+        "default": "/root/AstrBot/napcat/config/webui.json"
     },
     "check_interval": {
         "description": "检查间隔（秒）",

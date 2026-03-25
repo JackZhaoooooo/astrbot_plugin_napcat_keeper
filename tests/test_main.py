@@ -147,6 +147,15 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("未返回有效账号信息", result.detail)
         self.assertIn("not logged in", result.detail)
 
+    def test_payload_indicates_auth_failure_detects_unauthorized(self):
+        plugin = self.make_plugin()
+
+        result = plugin._payload_indicates_auth_failure(
+            {"code": -1, "message": "Unauthorized"}
+        )
+
+        self.assertEqual(result, "鉴权失败: Unauthorized")
+
     async def test_check_once_sends_logout_notification_only_on_transition(self):
         context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))
         plugin = self.make_plugin(
@@ -209,10 +218,55 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("123456 (NapCatBot)", result)
         self.assertIn("🟢 已登录", result)
 
-    async def test_fetch_login_state_falls_back_to_second_endpoint(self):
+    async def test_fetch_login_state_uses_webui_result_when_available(self):
         plugin = self.make_plugin()
+        plugin._request_webui_credential = AsyncMock(return_value=("credential", None))
+        plugin._post_json = AsyncMock(
+            side_effect=[
+                (
+                    {
+                        "code": 0,
+                        "data": {
+                            "isLogin": True,
+                        },
+                        "message": "success",
+                    },
+                    None,
+                ),
+                (
+                    {
+                        "code": 0,
+                        "data": {
+                            "uin": "987654321",
+                            "nick": "FallbackBot",
+                        },
+                        "message": "success",
+                    },
+                    None,
+                ),
+            ]
+        )
+
+        result = await plugin._fetch_login_state()
+
+        self.assertEqual(result.state, "logged_in")
+        self.assertEqual(result.user_id, "987654321")
+        self.assertEqual(result.nickname, "FallbackBot")
+
+    async def test_fetch_login_state_falls_back_to_second_onebot_endpoint(self):
+        plugin = self.make_plugin()
+        plugin._fetch_login_state_via_webui = AsyncMock(
+            return_value=(None, "WebUI 鉴权失败")
+        )
         plugin._request_json = AsyncMock(
             side_effect=[
+                (
+                    {
+                        "code": -1,
+                        "message": "Unauthorized",
+                    },
+                    None,
+                ),
                 (None, "HTTP 404"),
                 (
                     {
