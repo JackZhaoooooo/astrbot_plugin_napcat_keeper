@@ -32,8 +32,8 @@ RECOVERY_SERVICE_READY_POLL_SECONDS = 1
 RECOVERY_VERIFY_INTERVAL_SECONDS = 2
 RECOVERY_VERIFY_ATTEMPTS_WITH_AUTO_LOGIN = 8
 RECOVERY_VERIFY_ATTEMPTS_DEFAULT = 4
+QR_LOGIN_VALID_SECONDS = 120
 MANUAL_LOGIN_COOLDOWN_SECONDS_DEFAULT = 900
-MANUAL_LOGIN_RETRY_INTERVAL_SECONDS_DEFAULT = 20
 STATUS_TEXT = {
     "online": "🟢 在线",
     "offline": "🟡 未登录",
@@ -138,10 +138,6 @@ class NapcatKeeperPlugin(Star):
         self.manual_login_notify_umos = self._normalize_umo_list(
             config.get("manual_login_notify_umos", [])
         )
-        self.auto_qr_login_fallback = self._parse_bool(
-            config.get("auto_qr_login_fallback", True),
-            default=True,
-        )
         self.manual_login_cooldown_seconds = self._parse_int(
             config.get(
                 "manual_login_cooldown_seconds",
@@ -150,14 +146,7 @@ class NapcatKeeperPlugin(Star):
             default=MANUAL_LOGIN_COOLDOWN_SECONDS_DEFAULT,
             minimum=0,
         )
-        self.manual_login_retry_interval_seconds = self._parse_int(
-            config.get(
-                "manual_login_retry_interval_seconds",
-                MANUAL_LOGIN_RETRY_INTERVAL_SECONDS_DEFAULT,
-            ),
-            default=MANUAL_LOGIN_RETRY_INTERVAL_SECONDS_DEFAULT,
-            minimum=0,
-        )
+        self.qr_login_valid_seconds = QR_LOGIN_VALID_SECONDS
 
         self._consecutive_failures = 0
         self._is_monitoring = False
@@ -177,9 +166,9 @@ class NapcatKeeperPlugin(Star):
         self._log(f"NapCat URL: {self.napcat_url}")
         self._log(f"检查间隔: {self.check_interval}秒")
         self._log(f"自动恢复: {'启用' if self.enable_auto_restart else '禁用'}")
-        self._log(f"自动登录: {'启用' if self.enable_auto_login else '禁用'}")
+        self._log(f"二维码登录恢复: {'启用' if self.enable_auto_login else '禁用'}")
         self._log(f"调试日志: {'启用' if self.debug_mode else '禁用'}")
-        self._log(f"自动登录账号: {'已配置' if self.qq_account else '未配置'}")
+        self._log(f"展示账号: {'已配置' if self.qq_account else '未配置'}")
         logout_notify_text = (
             f"退出登录通知: {len(self.logout_notify_umos)} 个 UMO"
             if self.logout_notify_umos
@@ -198,11 +187,10 @@ class NapcatKeeperPlugin(Star):
         self._log(logout_notify_text)
         self._log(relogin_notify_text)
         self._log(manual_notify_text)
-        self._log(
-            f"二维码登录兜底: {'启用' if self.auto_qr_login_fallback else '禁用'}"
-        )
         self._log(f"人工登录冷却: {self.manual_login_cooldown_seconds} 秒")
-        self._log(f"人工登录续登重试间隔: {self.manual_login_retry_interval_seconds} 秒")
+        self._log(
+            f"二维码登录有效期: {self.qr_login_valid_seconds} 秒（超时自动刷新）"
+        )
         self._log("=" * 50)
 
     def _log(self, msg: str, level: str = "INFO", *, exc_info=False):
@@ -321,30 +309,6 @@ class NapcatKeeperPlugin(Star):
             value = max(minimum, value)
         return value
 
-    @staticmethod
-    def _auto_login_requires_manual_action(detail: str | None) -> bool:
-        if not detail:
-            return False
-        lowered = detail.lower()
-        keywords = [
-            "需要验证码",
-            "验证码",
-            "新设备验证",
-            "短信验证",
-            "人工处理",
-            "手动处理",
-            "manual",
-            "captcha",
-            "无法重复登录",
-            "其他位置登录",
-            "其他设备登录",
-            "登录态已失效",
-            "重新登录",
-            "需要扫码",
-            "扫码确认",
-        ]
-        return any(keyword in lowered for keyword in keywords)
-
     @classmethod
     def _extract_login_identity(
         cls, payload: dict[str, Any] | None
@@ -396,15 +360,6 @@ class NapcatKeeperPlugin(Star):
         if not text or text.lower() == "success":
             return None
         return text
-
-    @staticmethod
-    def _extract_first_url(text: str | None) -> str | None:
-        if not text:
-            return None
-        match = re.search(r"https?://[^\s|]+", text)
-        if not match:
-            return None
-        return match.group(0).rstrip("。.,，;；)>]}")
 
     @staticmethod
     def _looks_like_not_logged_in(message: str | None) -> bool:
@@ -534,66 +489,52 @@ class NapcatKeeperPlugin(Star):
             ]
         )
 
-    @staticmethod
-    def _classify_manual_login_kind(detail: str | None) -> str:
-        lowered = str(detail or "").lower()
-        if "新设备验证" in lowered or "jumpurl" in lowered:
-            return "new_device"
-        if "验证码" in lowered or "captcha" in lowered or "proofwater" in lowered:
-            return "captcha"
-        if "重新登录" in lowered or "登录态已失效" in lowered:
-            return "relogin"
-        return "manual"
-
-    def _get_reusable_manual_login_context(
-        self,
-        *,
-        account: str,
-        manual_kind: str,
-    ) -> dict[str, Any]:
+    def _get_reusable_manual_login_context(self, *, account: str) -> dict[str, Any]:
         if not self._is_manual_login_pending():
             return {}
 
         context = dict(self._manual_login_pending_context)
-        if context.get("account") != account:
-            return {}
-        if context.get("manual_kind") != manual_kind:
+        if str(context.get("account") or "").strip() != str(account or "").strip():
             return {}
         return context
 
     @staticmethod
-    def _apply_manual_login_context_to_detail(
-        detail: str,
-        context: dict[str, Any] | None,
-    ) -> str:
-        if not context:
-            return detail
+    def _normalize_timestamp(raw_value: Any) -> float:
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if value > 0 else 0.0
 
-        updated_detail = detail
-        proof_url = context.get("proof_url")
-        current_first_url = NapcatKeeperPlugin._extract_first_url(updated_detail)
-        manual_kind = context.get("manual_kind")
-        if (
-            proof_url
-            and current_first_url
-            and current_first_url != proof_url
-            and manual_kind in {"captcha", "new_device"}
-        ):
-            updated_detail = updated_detail.replace(current_first_url, proof_url, 1)
+    def _manual_login_qrcode_remaining_seconds(
+        self,
+        context: dict[str, Any] | None = None,
+    ) -> int:
+        current_context = context or self._manual_login_pending_context
+        expires_at = self._normalize_timestamp(current_context.get("qrcode_expires_at"))
+        if expires_at <= 0:
+            return 0
+        return max(0, int(expires_at - time.monotonic()))
 
-        if proof_url and proof_url not in updated_detail:
-            updated_detail = NapcatKeeperPlugin._append_detail(
-                updated_detail,
-                f"验证地址: {proof_url}",
-            )
+    def _has_valid_manual_login_qrcode(
+        self,
+        context: dict[str, Any] | None = None,
+    ) -> bool:
+        current_context = context or self._manual_login_pending_context
+        qrcode_url = str(current_context.get("qrcode_url") or "").strip()
+        return bool(qrcode_url) and self._manual_login_qrcode_remaining_seconds(
+            current_context
+        ) > 0
 
-        qrcode_url = context.get("qrcode_url")
-        if qrcode_url and qrcode_url not in updated_detail:
-            updated_detail = NapcatKeeperPlugin._append_detail(
-                updated_detail,
-                f"二维码地址: {qrcode_url}",
-            )
-        return updated_detail
+    def _store_manual_login_qrcode(
+        self,
+        context: dict[str, Any],
+        qrcode_url: str,
+    ):
+        now = time.monotonic()
+        context["qrcode_url"] = qrcode_url
+        context["qrcode_generated_at"] = now
+        context["qrcode_expires_at"] = now + self.qr_login_valid_seconds
 
     def _update_manual_login_pending(
         self,
@@ -649,7 +590,7 @@ class NapcatKeeperPlugin(Star):
         self._manual_login_last_retry_at = time.monotonic()
         self._consecutive_failures = 0
         self._log(
-            "已进入人工登录等待模式，后续仅轮询登录状态，暂不重复重启 NapCat。"
+            "已进入二维码登录等待模式，后续仅轮询登录状态，暂不重复重启 NapCat。"
             f" | 冷却时长: {self._format_wait_seconds(cooldown)}"
             f" | 原因: {detail}",
             "WARNING",
@@ -663,12 +604,9 @@ class NapcatKeeperPlugin(Star):
     def _should_retry_manual_login_pending(self) -> bool:
         if not self._is_manual_login_pending():
             return False
-        retry_interval = max(0, int(self.manual_login_retry_interval_seconds))
-        if retry_interval == 0:
+        if not str(self._manual_login_pending_context.get("qrcode_url") or "").strip():
             return True
-        return (
-            time.monotonic() - self._manual_login_last_retry_at >= retry_interval
-        )
+        return self._manual_login_qrcode_remaining_seconds() <= 0
 
     def _mark_manual_login_retry(self):
         self._manual_login_last_retry_at = time.monotonic()
@@ -697,15 +635,20 @@ class NapcatKeeperPlugin(Star):
         ]
         if account:
             lines.append(f"账号: {account}")
-        proof_url = context.get("proof_url")
-        if proof_url:
-            lines.append(f"验证地址: {proof_url}")
         qrcode_url = context.get("qrcode_url")
         if qrcode_url:
             lines.append(f"二维码地址: {qrcode_url}")
+            qrcode_remaining_seconds = self._manual_login_qrcode_remaining_seconds(
+                context
+            )
+            lines.append(
+                "二维码有效期: "
+                f"{self._format_wait_seconds(qrcode_remaining_seconds or self.qr_login_valid_seconds)}"
+                "（超时后插件会自动重新生成并再次通知）"
+            )
         lines.append(f"说明: {detail}")
         lines.append(
-            "插件已切换为人工登录等待模式，后续仅轮询登录状态，不再重复重启 NapCat。"
+            "插件已切换为二维码登录等待模式，后续仅轮询登录状态，不再重复重启 NapCat。"
         )
         delivered = await self._send_notification_to_umos(
             targets,
@@ -726,16 +669,13 @@ class NapcatKeeperPlugin(Star):
 
         remaining_seconds = self._manual_login_pending_remaining_seconds()
         hold_level = "WARNING" if snapshot.overall_status == "offline" else "ERROR"
+        qrcode_remaining_seconds = self._manual_login_qrcode_remaining_seconds()
 
-        if (
-            self.enable_auto_login
-            and self.qq_account
-            and self._should_retry_manual_login_pending()
-        ):
+        if self.enable_auto_login and self._should_retry_manual_login_pending():
             self._mark_manual_login_retry()
             self._log(
-                f"[{current_time}] 当前处于人工登录等待期，"
-                "开始执行轻量续登重试，不重启 NapCat。"
+                f"[{current_time}] 当前处于二维码登录等待期，"
+                "当前二维码已超时，开始重新生成二维码并复查登录状态，不重启 NapCat。"
                 f" | 剩余等待: {self._format_wait_seconds(remaining_seconds)}"
                 f" | 原因: {self._manual_login_pending_reason}",
                 hold_level,
@@ -745,9 +685,10 @@ class NapcatKeeperPlugin(Star):
 
         self._consecutive_failures = 0
         self._log(
-            f"[{current_time}] 当前处于人工登录等待期，"
+            f"[{current_time}] 当前处于二维码登录等待期，"
             f"剩余 {self._format_wait_seconds(remaining_seconds)}，"
-            "本轮跳过自动恢复。"
+            f"当前二维码剩余有效期约 {self._format_wait_seconds(qrcode_remaining_seconds)}，"
+            "本轮继续等待扫码登录。"
             f" | 原因: {self._manual_login_pending_reason}",
             hold_level,
         )
@@ -824,55 +765,6 @@ class NapcatKeeperPlugin(Star):
         detail = f"获取 QQ 登录二维码失败，接口未返回二维码地址。 | 接口: {endpoint}"
         return None, self._append_detail(detail, refresh_note)
 
-    async def _fetch_new_device_qrcode(
-        self,
-        session: aiohttp.ClientSession,
-        credential: str,
-        account: str,
-        jump_url: str,
-    ) -> tuple[str | None, str]:
-        (
-            endpoint,
-            status_code,
-            payload,
-            raw_text,
-        ) = await self._call_webui_api(
-            session,
-            "/QQLogin/GetNewDeviceQRCode",
-            credential=credential,
-            payload={
-                "uin": account,
-                "jumpUrl": jump_url,
-            },
-        )
-        if payload is None:
-            response_text = raw_text or f"HTTP {status_code}"
-            return (
-                None,
-                "获取新设备验证二维码失败，接口返回了非 JSON 响应。"
-                f" | 接口: {endpoint} | 响应: {response_text}",
-            )
-
-        if not self._is_webui_success(payload):
-            return (
-                None,
-                f"{self._build_webui_error_detail('获取新设备验证二维码失败', payload, raw_text)}"
-                f" | 接口: {endpoint} | HTTP {status_code}",
-            )
-
-        data = self._extract_webui_response_data(payload)
-        qrcode_url = data.get("str_url") if isinstance(data, dict) else None
-        if qrcode_url:
-            return (
-                str(qrcode_url).strip(),
-                f"已获取新设备验证二维码。 | 接口: {endpoint}",
-            )
-
-        return (
-            None,
-            f"获取新设备验证二维码失败，接口未返回二维码地址。 | 接口: {endpoint}",
-        )
-
     async def _prepare_manual_login_assistance(
         self,
         session: aiohttp.ClientSession,
@@ -883,114 +775,95 @@ class NapcatKeeperPlugin(Star):
         notify: bool = True,
     ) -> str:
         assisted_detail = detail
-        manual_kind = self._classify_manual_login_kind(detail)
-        reusable_context = (
-            self._get_reusable_manual_login_context(
-                account=account,
-                manual_kind=manual_kind,
-            )
-            if not notify
-            else {}
+        context: dict[str, Any] = self._get_reusable_manual_login_context(
+            account=account
         )
-        context: dict[str, Any] = dict(reusable_context)
         context["account"] = account
-        context["manual_kind"] = manual_kind
-        first_url = self._extract_first_url(detail)
-        if first_url and not context.get("proof_url"):
-            context["proof_url"] = first_url
+        previous_qrcode_url = str(context.get("qrcode_url") or "").strip()
+        qrcode_refreshed = False
 
-        if "新设备验证" in detail and first_url:
-            if context.get("qrcode_url"):
-                assisted_detail = self._append_detail(
-                    assisted_detail,
-                    f"沿用已有新设备验证二维码: {context['qrcode_url']}",
+        if self._has_valid_manual_login_qrcode(context):
+            remaining_seconds = self._manual_login_qrcode_remaining_seconds(context)
+            assisted_detail = self._append_detail(
+                assisted_detail,
+                "沿用当前 QQ 登录二维码"
+                f"（剩余约 {self._format_wait_seconds(remaining_seconds)}）: "
+                f"{previous_qrcode_url}",
+            )
+        else:
+            try:
+                qrcode_url, qrcode_detail = await self._fetch_login_qrcode(
+                    session,
+                    credential,
+                    refresh=True,
                 )
-            else:
-                try:
-                    qrcode_url, qrcode_detail = await self._fetch_new_device_qrcode(
-                        session,
-                        credential,
-                        account,
-                        first_url,
+                if qrcode_url:
+                    self._store_manual_login_qrcode(context, qrcode_url)
+                    qrcode_refreshed = True
+                    qrcode_valid_text = self._format_wait_seconds(
+                        self.qr_login_valid_seconds
                     )
-                    if qrcode_url:
-                        context["qrcode_url"] = qrcode_url
+                    if previous_qrcode_url:
                         assisted_detail = self._append_detail(
                             assisted_detail,
-                            f"已获取新设备验证二维码，可直接扫码确认: {qrcode_url}",
-                        )
-                        self._log(
-                            "QQ 登录触发新设备验证，已获取辅助二维码。"
-                            f" | 账号: {account} | 二维码: {qrcode_url}"
+                            "上一张二维码已超时，已自动生成新的 QQ 登录二维码"
+                            f"（{qrcode_valid_text}内有效）: {qrcode_url}",
                         )
                     else:
                         assisted_detail = self._append_detail(
                             assisted_detail,
-                            f"新设备二维码获取失败: {qrcode_detail}",
+                            f"已生成 QQ 登录二维码（{qrcode_valid_text}内有效）: {qrcode_url}",
                         )
-                except Exception as e:
+                    self._log(
+                        "已生成 QQ 登录二维码，等待扫码登录。"
+                        f" | 账号: {account or '未指定'} | 二维码: {qrcode_url}"
+                    )
+                else:
+                    context.pop("qrcode_url", None)
+                    context.pop("qrcode_generated_at", None)
+                    context.pop("qrcode_expires_at", None)
                     assisted_detail = self._append_detail(
                         assisted_detail,
-                        f"新设备二维码获取异常: {e}",
+                        f"生成 QQ 登录二维码失败: {qrcode_detail}",
                     )
-        elif self.auto_qr_login_fallback:
-            if context.get("qrcode_url"):
+            except Exception as e:
+                context.pop("qrcode_url", None)
+                context.pop("qrcode_generated_at", None)
+                context.pop("qrcode_expires_at", None)
                 assisted_detail = self._append_detail(
                     assisted_detail,
-                    f"沿用已有二维码登录地址: {context['qrcode_url']}",
+                    f"生成 QQ 登录二维码异常: {e}",
                 )
-            else:
-                try:
-                    qrcode_url, qrcode_detail = await self._fetch_login_qrcode(
-                        session,
-                        credential,
-                        refresh=notify,
-                    )
-                    if qrcode_url:
-                        context["qrcode_url"] = qrcode_url
-                        assisted_detail = self._append_detail(
-                            assisted_detail,
-                            f"可改用二维码登录 NapCat: {qrcode_url}",
-                        )
-                        self._log(
-                            "已获取 QQ 登录二维码，自动登录流程改为等待扫码确认。"
-                            f" | 账号: {account} | 二维码: {qrcode_url}"
-                        )
-                    else:
-                        assisted_detail = self._append_detail(
-                            assisted_detail,
-                            f"二维码登录兜底失败: {qrcode_detail}",
-                        )
-                except Exception as e:
-                    assisted_detail = self._append_detail(
-                        assisted_detail,
-                        f"二维码登录兜底异常: {e}",
-                    )
 
-        assisted_detail = self._apply_manual_login_context_to_detail(
-            assisted_detail,
-            context,
-        )
+        if not self._has_valid_manual_login_qrcode(context):
+            self._clear_manual_login_pending()
+            return self._append_detail(
+                assisted_detail,
+                "当前未拿到可用二维码，本轮保持常规恢复策略，下次将继续尝试生成二维码。",
+            )
+
         assisted_detail = self._append_detail(
             assisted_detail,
-            "插件将进入人工登录等待模式，"
-            f"在接下来的 {self._format_wait_seconds(self.manual_login_cooldown_seconds)} 内仅轮询登录状态。",
+            "插件将进入二维码登录等待模式，"
+            f"在接下来的 {self._format_wait_seconds(self.manual_login_cooldown_seconds)} 内仅轮询登录状态，"
+            f"二维码每 {self._format_wait_seconds(self.qr_login_valid_seconds)} 自动刷新一次。",
         )
         self._update_manual_login_pending(
             assisted_detail,
             context=context,
-            preserve_window=not notify,
+            preserve_window=not qrcode_refreshed,
         )
-        if notify:
+        should_notify = notify or qrcode_refreshed
+        if should_notify:
             await self._notify_manual_login_required(
                 assisted_detail,
-                account=account,
+                account=account or None,
                 context=context,
             )
         else:
             self._log(
-                "人工登录等待期内仍检测到需要人工处理，保持等待状态并跳过重复通知。"
-                f" | 账号: {account} | 原因: {assisted_detail}",
+                "二维码登录等待期内仍未扫码成功，当前二维码仍有效，跳过重复通知。"
+                f" | 账号: {account or '未指定'} | 原因: {assisted_detail}",
                 "WARNING",
             )
         return assisted_detail
@@ -1652,7 +1525,7 @@ class NapcatKeeperPlugin(Star):
                     if self._is_manual_login_pending():
                         self._clear_manual_login_pending()
                         self._log(
-                            f"[{current_time}] QQ 已重新登录，退出人工登录等待模式。"
+                            f"[{current_time}] QQ 已重新登录，退出二维码登录等待模式。"
                         )
                     if self._consecutive_failures > 0:
                         self._log(
@@ -2086,18 +1959,10 @@ class NapcatKeeperPlugin(Star):
 
         data = self._extract_webui_response_data(payload)
         if isinstance(data, dict) and data.get("needCaptcha"):
-            proof_url = data.get("proofWaterUrl")
-            detail = "QQ 密码登录需要验证码，当前无法自动完成后续步骤。"
-            if proof_url:
-                detail = f"{detail} | 验证地址: {proof_url}"
-            return False, detail
+            return False, "QQ 密码登录需要验证码，当前二维码登录模式不会继续处理该流程。"
 
         if isinstance(data, dict) and data.get("needNewDevice"):
-            jump_url = data.get("jumpUrl")
-            detail = "QQ 密码登录触发新设备验证，当前无法自动完成后续步骤。"
-            if jump_url:
-                detail = f"{detail} | 验证地址: {jump_url}"
-            return False, detail
+            return False, "QQ 密码登录触发新设备验证，当前二维码登录模式不会继续处理该流程。"
 
         return (
             True,
@@ -2111,89 +1976,45 @@ class NapcatKeeperPlugin(Star):
         notify_manual_action: bool = True,
     ) -> AutoLoginAttemptResult:
         account = str(self.qq_account or "").strip()
-        password = str(self.qq_password or "").strip()
         if reset_manual_pending:
             self._clear_manual_login_pending()
         if not self.enable_auto_login:
             result = AutoLoginAttemptResult(
                 submitted=False,
-                detail="已禁用 QQ 自动登录，跳过自动登录流程。",
+                detail="已禁用 QQ 二维码登录恢复，跳过二维码登录流程。",
             )
             self._log(result.detail, result.level)
             return result
 
-        if not account:
-            result = AutoLoginAttemptResult(
-                submitted=False,
-                detail="未配置 qq_account，跳过 QQ 自动登录。",
-            )
-            self._log(result.detail, result.level)
-            return result
+        self._log(
+            "准备生成 QQ 登录二维码"
+            f" | 账号: {account or '未配置（扫码后以实际登录账号为准）'}"
+        )
 
-        login_mode = "密码登录" if password else "快速登录"
-        self._log(f"准备执行 QQ 自动登录 | 账号: {account} | 方式: {login_mode}")
-
+        manual_action_required = False
         try:
             async with aiohttp.ClientSession() as session:
-                credential = await self._request_webui_credential(session=session)
-                self._log("NapCat WebUI 鉴权成功，已获取临时 Credential。")
-                if password:
-                    password_success, password_detail = await self._password_login_by_account(
-                        session,
-                        credential,
-                        account,
-                        password,
-                    )
-                    if password_success:
-                        success = True
-                        detail = password_detail
-                    elif self._auto_login_requires_manual_action(password_detail):
-                        detail = await self._prepare_manual_login_assistance(
-                            session,
-                            credential,
-                            account,
-                            password_detail,
-                            notify=notify_manual_action,
-                        )
-                        success = False
-                    else:
-                        self._log(
-                            "QQ 密码登录未成功，尝试回退到快速登录。"
-                            f" | 原因: {password_detail}",
-                            "WARNING",
-                        )
-                        quick_success, quick_detail = await self._quick_login_by_account(
-                            session,
-                            credential,
-                            account,
-                        )
-                        success = quick_success
-                        if quick_success:
-                            detail = (
-                                "QQ 密码登录未成功，但已回退到快速登录并提交成功。"
-                                f" | 密码登录原因: {password_detail}"
-                                f" | 快速登录结果: {quick_detail}"
-                            )
-                        else:
-                            detail = (
-                                "QQ 密码登录与快速登录均未成功。"
-                                f" | 密码登录原因: {password_detail}"
-                                f" | 快速登录原因: {quick_detail}"
-                            )
+                credential = ""
+                if str(self.napcat_token or "").strip():
+                    credential = await self._request_webui_credential(session=session)
+                    self._log("NapCat WebUI 鉴权成功，已获取临时 Credential。")
                 else:
-                    success, detail = await self._quick_login_by_account(
-                        session,
-                        credential,
-                        account,
+                    self._log(
+                        "未配置 napcat_token，将直接调用 NapCat WebUI 二维码接口。",
+                        "WARNING",
                     )
-                    if not success and self._auto_login_requires_manual_action(detail):
-                        detail = await self._prepare_manual_login_assistance(
-                            session,
-                            credential,
-                            account,
-                            detail,
-                            notify=notify_manual_action,
-                        )
+
+                detail = await self._prepare_manual_login_assistance(
+                    session,
+                    credential,
+                    account,
+                    "NapCat 当前未登录，需要扫码完成 QQ 登录。",
+                    notify=notify_manual_action,
+                )
+                success = False
+                manual_action_required = self._has_valid_manual_login_qrcode(
+                    self._manual_login_pending_context
+                )
         except (ValueError, RuntimeError) as e:
             result = AutoLoginAttemptResult(
                 submitted=False,
@@ -2205,7 +2026,7 @@ class NapcatKeeperPlugin(Star):
         except asyncio.TimeoutError:
             result = AutoLoginAttemptResult(
                 submitted=False,
-                detail="QQ 自动登录超时（5 秒内未收到响应）。",
+                detail="QQ 二维码登录流程超时（5 秒内未收到响应）。",
                 level="ERROR",
             )
             self._log(result.detail, result.level)
@@ -2213,7 +2034,7 @@ class NapcatKeeperPlugin(Star):
         except aiohttp.ClientError as e:
             result = AutoLoginAttemptResult(
                 submitted=False,
-                detail=f"QQ 自动登录请求失败: {e}",
+                detail=f"QQ 二维码登录请求失败: {e}",
                 level="ERROR",
             )
             self._log(result.detail, result.level)
@@ -2221,7 +2042,7 @@ class NapcatKeeperPlugin(Star):
         except Exception as e:
             result = AutoLoginAttemptResult(
                 submitted=False,
-                detail=f"QQ 自动登录流程异常: {e}",
+                detail=f"QQ 二维码登录流程异常: {e}",
                 level="ERROR",
             )
             self._log(result.detail, result.level, exc_info=True)
@@ -2230,10 +2051,8 @@ class NapcatKeeperPlugin(Star):
         result = AutoLoginAttemptResult(
             submitted=success,
             detail=detail,
-            level="INFO" if success else "WARNING",
-            manual_action_required=(
-                not success and self._auto_login_requires_manual_action(detail)
-            ),
+            level="INFO" if success else ("WARNING" if manual_action_required else "ERROR"),
+            manual_action_required=manual_action_required,
         )
         self._log(result.detail, result.level)
         return result
@@ -2369,7 +2188,7 @@ class NapcatKeeperPlugin(Star):
         self._webui_credential = None
         self._webui_credential_cached_at = 0.0
         self._log("=" * 50)
-        self._log("NapCat 服务在线，开始仅执行 QQ 重新登录流程")
+        self._log("NapCat 服务在线，开始仅执行 QQ 二维码登录恢复流程")
         self._log("=" * 50)
 
         try:
@@ -2385,29 +2204,33 @@ class NapcatKeeperPlugin(Star):
 
             auto_login_result = AutoLoginAttemptResult(
                 submitted=False,
-                detail="未执行 QQ 自动登录。",
+                detail="未执行 QQ 登录处理。",
             )
-            if self.enable_auto_login and self.qq_account:
-                self._log("[登录恢复] 开始执行 QQ 自动登录...")
+            if self.enable_auto_login:
+                self._log("[登录恢复] 开始处理 QQ 登录二维码...")
                 auto_login_result = await self._auto_login_qq(
                     reset_manual_pending=not keep_manual_pending,
                     notify_manual_action=not keep_manual_pending,
                 )
-                if auto_login_result.submitted:
+                if auto_login_result.manual_action_required:
                     self._log(
-                        "[登录恢复] ✓ QQ 自动登录已提交，进入快速验证阶段。"
+                        "[登录恢复] 已生成 QQ 登录二维码，等待扫码登录。"
+                        f" | 结果: {auto_login_result.detail}",
+                        "WARNING",
+                    )
+                elif auto_login_result.submitted:
+                    self._log(
+                        "[登录恢复] ✓ QQ 登录请求已提交，进入快速验证阶段。"
                         f" | 结果: {auto_login_result.detail}"
                     )
                 else:
                     self._log(
-                        "[登录恢复] QQ 自动登录未成功。"
+                        "[登录恢复] QQ 登录处理未成功。"
                         f" | 原因: {auto_login_result.detail}",
-                        "WARNING",
+                        auto_login_result.level,
                     )
-            elif self.enable_auto_login:
-                self._log("[登录恢复] 已跳过 QQ 自动登录: 未配置 qq_account。")
             else:
-                self._log("[登录恢复] 已跳过 QQ 自动登录: 配置已禁用。")
+                self._log("[登录恢复] 已跳过 QQ 登录处理: 配置已禁用。")
 
             verify_attempts = self._resolve_verify_attempts(
                 auto_login_result,
@@ -2416,8 +2239,8 @@ class NapcatKeeperPlugin(Star):
             if auto_login_result.manual_action_required:
                 verify_attempts = 1
                 self._log(
-                    "[登录恢复] 检测到当前需要人工完成验证，"
-                    "跳过重复快速重试，直接输出当前状态。",
+                    "[登录恢复] 检测到当前需要扫码登录，"
+                    "本轮只做 1 次状态校验，若二维码超时后续会自动重新生成。",
                     "WARNING",
                 )
             self._log(
@@ -2438,8 +2261,11 @@ class NapcatKeeperPlugin(Star):
                 return
 
             auto_login_reason = ""
-            if self.enable_auto_login and self.qq_account and not auto_login_result.submitted:
-                auto_login_reason = f" | QQ 自动登录未成功原因: {auto_login_result.detail}"
+            if self.enable_auto_login and not auto_login_result.submitted:
+                if auto_login_result.manual_action_required:
+                    auto_login_reason = f" | 当前仍在等待二维码扫码登录: {auto_login_result.detail}"
+                else:
+                    auto_login_reason = f" | QQ 登录处理失败原因: {auto_login_result.detail}"
 
             final_level = (
                 "WARNING"
@@ -2504,28 +2330,32 @@ class NapcatKeeperPlugin(Star):
                     "WARNING",
                 )
 
-            self._log("[5/6] 处理 QQ 自动登录...")
+            self._log("[5/6] 处理 QQ 登录二维码...")
             auto_login_result = AutoLoginAttemptResult(
                 submitted=False,
-                detail="未执行 QQ 自动登录。",
+                detail="未执行 QQ 登录处理。",
             )
-            if self.enable_auto_login and self.qq_account:
+            if self.enable_auto_login:
                 auto_login_result = await self._auto_login_qq()
-                if auto_login_result.submitted:
+                if auto_login_result.manual_action_required:
                     self._log(
-                        "[5/6] ✓ QQ 自动登录已提交，进入快速验证阶段。"
+                        "[5/6] 已生成 QQ 登录二维码，等待扫码登录。"
+                        f" | 结果: {auto_login_result.detail}",
+                        "WARNING",
+                    )
+                elif auto_login_result.submitted:
+                    self._log(
+                        "[5/6] ✓ QQ 登录请求已提交，进入快速验证阶段。"
                         f" | 结果: {auto_login_result.detail}"
                     )
                 else:
                     self._log(
-                        "[5/6] QQ 自动登录未成功。"
+                        "[5/6] QQ 登录处理未成功。"
                         f" | 原因: {auto_login_result.detail}",
-                        "WARNING",
+                        auto_login_result.level,
                     )
-            elif self.enable_auto_login:
-                self._log("[5/6] 已跳过 QQ 自动登录: 未配置 qq_account。")
             else:
-                self._log("[5/6] 已跳过 QQ 自动登录: 配置已禁用。")
+                self._log("[5/6] 已跳过 QQ 登录处理: 配置已禁用。")
 
             verify_attempts = self._resolve_verify_attempts(
                 auto_login_result,
@@ -2534,8 +2364,8 @@ class NapcatKeeperPlugin(Star):
             if auto_login_result.manual_action_required:
                 verify_attempts = 1
                 self._log(
-                    "[6/6] 检测到 QQ 自动登录失败原因需要人工处理，"
-                    "跳过重复快速重试，直接输出当前状态。",
+                    "[6/6] 检测到当前需要扫码登录，"
+                    "本轮只做 1 次状态校验，若二维码超时后续会自动重新生成。",
                     "WARNING",
                 )
             self._log(
@@ -2554,8 +2384,11 @@ class NapcatKeeperPlugin(Star):
                 return
 
             auto_login_reason = ""
-            if self.enable_auto_login and self.qq_account and not auto_login_result.submitted:
-                auto_login_reason = f" | QQ 自动登录未成功原因: {auto_login_result.detail}"
+            if self.enable_auto_login and not auto_login_result.submitted:
+                if auto_login_result.manual_action_required:
+                    auto_login_reason = f" | 当前仍在等待二维码扫码登录: {auto_login_result.detail}"
+                else:
+                    auto_login_reason = f" | QQ 登录处理失败原因: {auto_login_result.detail}"
 
             final_level = "WARNING" if snapshot.overall_status == "offline" else "ERROR"
             self._log(
@@ -2648,10 +2481,21 @@ class NapcatKeeperPlugin(Star):
 
             manual_login_info = ""
             if self._is_manual_login_pending():
+                qrcode_url = str(
+                    self._manual_login_pending_context.get("qrcode_url") or ""
+                ).strip()
+                qrcode_info = ""
+                if qrcode_url:
+                    qrcode_info = (
+                        f"\n🔳 当前二维码: {qrcode_url}"
+                        "\n⌛ 二维码剩余有效期: "
+                        f"{self._format_wait_seconds(self._manual_login_qrcode_remaining_seconds())}"
+                    )
                 manual_login_info = (
-                    "\n🔐 人工登录等待: 是"
+                    "\n🔐 二维码登录等待: 是"
                     f"\n⏳ 剩余冷却: {self._format_wait_seconds(self._manual_login_pending_remaining_seconds())}"
                     f"\n🧭 等待原因: {self._manual_login_pending_reason}"
+                    f"{qrcode_info}"
                 )
 
             message = (

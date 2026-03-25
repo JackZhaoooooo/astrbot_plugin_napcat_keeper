@@ -44,19 +44,13 @@
     "enable_auto_login": {
         "description": "掉线后自动重新登录",
         "type": "bool",
-        "hint": "需要配置下方的 QQ 账号密码",
+        "hint": "开启后会自动生成 QQ 登录二维码",
         "default": true
     },
     "qq_account": {
-        "description": "QQ 账号（用于自动登录）",
+        "description": "QQ 账号（可选）",
         "type": "string",
-        "hint": "填写机器人 QQ 号",
-        "default": ""
-    },
-    "qq_password": {
-        "description": "QQ 密码（用于自动登录）",
-        "type": "string",
-        "hint": "留空则使用快速登录（需要先登录成功一次）",
+        "hint": "可选，仅用于日志和通知中展示预期账号",
         "default": ""
     },
     "logout_notify_umos": {
@@ -80,29 +74,17 @@
     "manual_login_notify_umos": {
         "description": "登录辅助通知",
         "type": "list",
-        "hint": "当 QQ 登录需要人工验证或扫码时主动通知；留空则默认复用退出/重新登录通知目标",
+        "hint": "当 QQ 登录需要扫码时主动通知；留空则默认复用退出/重新登录通知目标",
         "items": {
             "type": "string"
         },
         "default": []
     },
-    "auto_qr_login_fallback": {
-        "description": "启用二维码登录兜底",
-        "type": "bool",
-        "hint": "当密码登录触发验证码/重新登录时，自动尝试获取 NapCat 二维码登录链接",
-        "default": true
-    },
     "manual_login_cooldown_seconds": {
-        "description": "人工登录冷却时长（秒）",
+        "description": "二维码登录等待时长（秒）",
         "type": "int",
-        "hint": "需要验证码或扫码时，冷却期内仅轮询登录状态，不重复重启 NapCat",
+        "hint": "等待扫码期间仅轮询登录状态，不重复重启 NapCat；二维码每 2 分钟自动刷新",
         "default": 900
-    },
-    "manual_login_retry_interval_seconds": {
-        "description": "人工登录续登重试间隔（秒）",
-        "type": "int",
-        "hint": "等待验证码/扫码完成后，插件会按此间隔自动重新提交登录，但不会重启 NapCat",
-        "default": 20
     },
     "debug": {
         "description": "调试日志",
