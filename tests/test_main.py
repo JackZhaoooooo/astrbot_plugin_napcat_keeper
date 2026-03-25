@@ -1,6 +1,9 @@
 import asyncio
 import importlib
+import json
+import os
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -110,12 +113,22 @@ def load_plugin_module():
 class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.module, self.platform_logger = load_plugin_module()
+        self._tempdirs = []
+
+    def tearDown(self):
+        while self._tempdirs:
+            self._tempdirs.pop().cleanup()
 
     def make_plugin(self, config=None, context=None):
         if context is None:
             context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))
+        merged_config = dict(config or {})
+        if "napcat_dir" not in merged_config:
+            tmpdir = tempfile.TemporaryDirectory()
+            self._tempdirs.append(tmpdir)
+            merged_config["napcat_dir"] = tmpdir.name
         with patch.object(self.module, "_get_file_logger", return_value=DummyLogger()):
-            plugin = self.module.NapcatKeeperPlugin(context, config or {})
+            plugin = self.module.NapcatKeeperPlugin(context, merged_config)
         return plugin
 
     def make_snapshot(
@@ -234,6 +247,84 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(credential, "cached-credential")
         self.assertEqual(plugin._post_json_request.await_count, 1)
+
+    async def test_request_webui_credential_uses_disk_cache_before_reauth(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin = self.make_plugin(
+                {
+                    "napcat_token": "token123",
+                    "napcat_dir": tmpdir,
+                }
+            )
+            os.makedirs(os.path.join(tmpdir, "cache"), exist_ok=True)
+            with open(plugin._webui_credential_cache_path(), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "credential": "disk-credential",
+                        "cached_at": self.module.time.time(),
+                        "napcat_root_url": plugin._normalize_napcat_root_url(),
+                        "token_hash": plugin._hash_text("token123"),
+                    },
+                    f,
+                    ensure_ascii=False,
+                )
+
+            plugin._post_json_request = AsyncMock()
+
+            credential = await plugin._request_webui_credential(session=object())
+
+            self.assertEqual(credential, "disk-credential")
+            self.assertEqual(plugin._post_json_request.await_count, 0)
+
+    async def test_call_webui_api_retries_once_after_credential_expires(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin = self.make_plugin(
+                {
+                    "napcat_token": "token123",
+                    "napcat_dir": tmpdir,
+                }
+            )
+            plugin._post_json_request = AsyncMock(
+                side_effect=[
+                    (
+                        200,
+                        {"code": 1, "message": "Unauthorized", "data": None},
+                        None,
+                    ),
+                    (
+                        200,
+                        {"code": 0, "message": "success", "data": {"ok": True}},
+                        None,
+                    ),
+                ]
+            )
+            plugin._request_webui_credential = AsyncMock(return_value="credential-456")
+
+            endpoint, status_code, payload, raw_text = await plugin._call_webui_api(
+                object(),
+                "/QQLogin/CheckLoginStatus",
+                credential="credential-123",
+            )
+
+            self.assertEqual(
+                endpoint,
+                "http://localhost:6099/api/QQLogin/CheckLoginStatus",
+            )
+            self.assertEqual(status_code, 200)
+            self.assertEqual(payload, {"code": 0, "message": "success", "data": {"ok": True}})
+            self.assertIsNone(raw_text)
+            self.assertEqual(plugin._post_json_request.await_count, 2)
+            self.assertEqual(plugin._request_webui_credential.await_count, 1)
+            self.assertTrue(
+                plugin._post_json_request.await_args_list[0].kwargs["headers"][
+                    "Authorization"
+                ].endswith("credential-123")
+            )
+            self.assertTrue(
+                plugin._post_json_request.await_args_list[1].kwargs["headers"][
+                    "Authorization"
+                ].endswith("credential-456")
+            )
 
     def test_emit_snapshot_logs_are_clear(self):
         plugin = self.make_plugin()

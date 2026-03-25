@@ -5,6 +5,7 @@ NapCat QQ 保活插件
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -26,7 +27,8 @@ LOG_FILE = "/root/AstrBot/logs/napcat_keeper.log"
 FILE_LOGGER_NAME = "astrbot_plugin_napcat_keeper.file"
 SUCCESS_HTTP_CODES = {200, 301, 302, 303, 307, 308}
 WEBUI_SUCCESS_CODES = {0, "0"}
-WEBUI_CREDENTIAL_CACHE_TTL_SECONDS = 300
+WEBUI_CREDENTIAL_CACHE_TTL_SECONDS = 3300
+WEBUI_CREDENTIAL_CACHE_FILE_NAME = "webui_credential.json"
 RECOVERY_SERVICE_READY_TIMEOUT_SECONDS = 15
 RECOVERY_SERVICE_READY_POLL_SECONDS = 1
 RECOVERY_VERIFY_INTERVAL_SECONDS = 2
@@ -242,6 +244,10 @@ class NapcatKeeperPlugin(Star):
         return urljoin(self._normalize_napcat_root_url().rstrip("/") + "/", api_path)
 
     @staticmethod
+    def _hash_text(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    @staticmethod
     def _hash_webui_token(token: str) -> str:
         return hashlib.sha256(f"{token}.napcat".encode("utf-8")).hexdigest()
 
@@ -448,6 +454,93 @@ class NapcatKeeperPlugin(Star):
             return compact
         return compact[: limit - 3] + "..."
 
+    def _webui_credential_cache_path(self) -> str:
+        return os.path.join(
+            self.napcat_dir,
+            "cache",
+            WEBUI_CREDENTIAL_CACHE_FILE_NAME,
+        )
+
+    def _save_cached_webui_credential(self, credential: str):
+        self._webui_credential = credential
+        self._webui_credential_cached_at = time.monotonic()
+
+        token = str(self.napcat_token or "").strip()
+        if not credential or not token:
+            return
+
+        cache_path = self._webui_credential_cache_path()
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as cache_file:
+                json.dump(
+                    {
+                        "credential": credential,
+                        "cached_at": time.time(),
+                        "napcat_root_url": self._normalize_napcat_root_url(),
+                        "token_hash": self._hash_text(token),
+                    },
+                    cache_file,
+                    ensure_ascii=False,
+                )
+        except Exception as e:
+            self._log(f"写入 WebUI Credential 缓存失败: {e}", "WARNING")
+
+    def _clear_cached_webui_credential(self, *, clear_disk: bool):
+        self._webui_credential = None
+        self._webui_credential_cached_at = 0.0
+        if not clear_disk:
+            return
+
+        cache_path = self._webui_credential_cache_path()
+        try:
+            if os.path.exists(cache_path):
+                os.remove(cache_path)
+        except Exception as e:
+            self._log(f"清理 WebUI Credential 缓存失败: {e}", "WARNING")
+
+    def _load_cached_webui_credential_from_disk(self) -> str | None:
+        token = str(self.napcat_token or "").strip()
+        if not token:
+            return None
+
+        cache_path = self._webui_credential_cache_path()
+        if not os.path.exists(cache_path):
+            return None
+
+        try:
+            with open(cache_path, "r", encoding="utf-8") as cache_file:
+                payload = json.load(cache_file)
+        except Exception as e:
+            self._log(f"读取 WebUI Credential 缓存失败: {e}", "WARNING")
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        credential = str(payload.get("credential") or "").strip()
+        if not credential:
+            return None
+
+        cached_at = payload.get("cached_at")
+        try:
+            cached_at = float(cached_at)
+        except (TypeError, ValueError):
+            return None
+
+        if cached_at <= 0 or time.time() - cached_at >= WEBUI_CREDENTIAL_CACHE_TTL_SECONDS:
+            return None
+
+        if str(payload.get("napcat_root_url") or "").strip() != self._normalize_napcat_root_url():
+            return None
+
+        if str(payload.get("token_hash") or "").strip() != self._hash_text(token):
+            return None
+
+        self._webui_credential = credential
+        self._webui_credential_cached_at = time.monotonic()
+        return credential
+
     @classmethod
     def _build_webui_error_detail(
         cls,
@@ -461,6 +554,29 @@ class NapcatKeeperPlugin(Star):
         if message:
             return f"{action}: {message}"
         return action
+
+    @classmethod
+    def _is_webui_unauthorized_response(
+        cls,
+        status_code: int | None,
+        payload: dict[str, Any] | None = None,
+        raw_text: str | None = None,
+    ) -> bool:
+        if status_code in {401, 403}:
+            return True
+        detail = cls._build_webui_error_detail(
+            "WebUI 鉴权失败",
+            payload,
+            raw_text,
+        ).lower()
+        keywords = [
+            "unauthorized",
+            "鉴权失败",
+            "未授权",
+            "invalid credential",
+            "credential",
+        ]
+        return any(keyword in detail for keyword in keywords)
 
     @staticmethod
     def _append_detail(base: str, extra: str | None) -> str:
@@ -943,6 +1059,11 @@ class NapcatKeeperPlugin(Star):
         ):
             return cached_credential
 
+        if not force_refresh:
+            disk_cached_credential = self._load_cached_webui_credential_from_disk()
+            if disk_cached_credential:
+                return disk_cached_credential
+
         endpoint = self._build_webui_api_url("/auth/login")
         created_session = session is None
         if created_session:
@@ -995,8 +1116,7 @@ class NapcatKeeperPlugin(Star):
             raise RuntimeError(
                 f"NapCat WebUI 鉴权成功，但未返回 Credential。 | 接口: {endpoint}"
             )
-        self._webui_credential = credential
-        self._webui_credential_cached_at = time.monotonic()
+        self._save_cached_webui_credential(credential)
         return credential
 
     async def _call_webui_api(
@@ -1006,6 +1126,7 @@ class NapcatKeeperPlugin(Star):
         *,
         credential: str,
         payload: dict[str, Any] | None = None,
+        retry_on_unauthorized: bool = True,
     ) -> tuple[str, int, dict[str, Any] | None, str | None]:
         endpoint = self._build_webui_api_url(path)
         status_code, response_payload, raw_text = await self._post_json_request(
@@ -1014,6 +1135,23 @@ class NapcatKeeperPlugin(Star):
             payload=payload,
             headers=self._build_webui_auth_headers(credential),
         )
+
+        if retry_on_unauthorized and self._is_webui_unauthorized_response(
+            status_code,
+            response_payload,
+            raw_text,
+        ):
+            self._clear_cached_webui_credential(clear_disk=True)
+            refreshed_credential = await self._request_webui_credential(
+                session=session,
+                force_refresh=True,
+            )
+            status_code, response_payload, raw_text = await self._post_json_request(
+                session,
+                endpoint,
+                payload=payload,
+                headers=self._build_webui_auth_headers(refreshed_credential),
+            )
         return endpoint, status_code, response_payload, raw_text
 
     @classmethod
@@ -2237,8 +2375,6 @@ class NapcatKeeperPlugin(Star):
         keep_manual_pending: bool = False,
     ):
         """NapCat 服务仍在线时，仅执行 QQ 重新登录流程。"""
-        self._webui_credential = None
-        self._webui_credential_cached_at = 0.0
         self._log("=" * 50)
         self._log("NapCat 服务在线，开始仅执行 QQ 登录恢复流程")
         self._log("=" * 50)
@@ -2357,8 +2493,6 @@ class NapcatKeeperPlugin(Star):
     ):
         """恢复 NapCat。"""
         self._last_restart_time = datetime.now()
-        self._webui_credential = None
-        self._webui_credential_cached_at = 0.0
         self._clear_manual_login_pending()
         self._log("=" * 50)
         self._log("开始恢复 NapCat")
