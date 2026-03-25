@@ -30,6 +30,7 @@ DEFAULT_WEBUI_CONFIG_PATH = "/root/AstrBot/napcat/config/webui.json"
 DEFAULT_NOTIFY_RETRY_COOLDOWN_SECONDS = 30
 DEFAULT_QR_NOTIFY_RETRY_COOLDOWN_SECONDS = 120
 DEFAULT_QR_IMAGE_DIR = "/tmp/astrbot_plugin_napcat_keeper_qr"
+QR_EXPIRE_HINT_SECONDS = 120
 MIN_CHECK_INTERVAL = 5
 MIN_REQUEST_TIMEOUT = 3
 MIN_NOTIFY_RETRY_COOLDOWN_SECONDS = 5
@@ -115,6 +116,7 @@ class NapcatKeeperPlugin(Star):
         self._last_qr_notify_attempt_at = 0.0
         self._last_qr_url: str | None = None
         self._last_qr_image_path: str | None = None
+        self._last_qr_generated_at = 0.0
         self._instance_label = hex(id(self))
 
     async def initialize(self):
@@ -212,7 +214,7 @@ class NapcatKeeperPlugin(Star):
             await self._send_qr_notifications_for_state(
                 state,
                 trigger="自动检测",
-                force_refresh=False,
+                force_refresh=True,
             )
 
     def _should_attempt_logout_notification(
@@ -397,6 +399,13 @@ class NapcatKeeperPlugin(Star):
             if not credential:
                 return None, f"WebUI 鉴权失败: {auth_error}"
 
+            if force_refresh:
+                refreshed_qr_url, refresh_info = await self._refresh_qr_code(credential)
+                if refreshed_qr_url:
+                    return refreshed_qr_url, None
+                if refresh_info:
+                    errors.append(refresh_info)
+
             payload, request_error = await self._post_json(
                 status_endpoint,
                 {},
@@ -425,6 +434,17 @@ class NapcatKeeperPlugin(Star):
             is_login = data.get("isLogin")
             qr_url = self._extract_qr_url(data)
             if qr_url:
+                if (
+                    force_refresh
+                    and self._last_qr_url
+                    and self._last_qr_url == qr_url
+                    and self._last_qr_generated_at > 0
+                ):
+                    age = time.monotonic() - self._last_qr_generated_at
+                    if age >= float(QR_EXPIRE_HINT_SECONDS):
+                        errors.append(
+                            f"二维码链接与上次一致且已超过 {QR_EXPIRE_HINT_SECONDS} 秒，可能已过期"
+                        )
                 return qr_url, None
 
             if is_login is True:
@@ -439,6 +459,56 @@ class NapcatKeeperPlugin(Star):
         if errors:
             return None, "；".join(errors)
         return None, "未获取到二维码链接"
+
+    async def _refresh_qr_code(
+        self,
+        credential: str,
+    ) -> tuple[str | None, str | None]:
+        refresh_endpoints = [
+            f"{self.napcat_url}/api/QQLogin/RefreshQrCode",
+            f"{self.napcat_url}/api/QQLogin/RefreshQRCode",
+        ]
+        errors: list[str] = []
+
+        for endpoint in refresh_endpoints:
+            payload, request_error = await self._post_json(
+                endpoint,
+                {},
+                headers=self._build_webui_headers(credential),
+            )
+            if payload is None:
+                if request_error and request_error.startswith("HTTP 404"):
+                    continue
+                if request_error:
+                    errors.append(f"{endpoint}: {request_error}")
+                continue
+
+            auth_failure = self._payload_indicates_auth_failure(payload)
+            if auth_failure:
+                errors.append(f"{endpoint}: {auth_failure}")
+                continue
+
+            code = payload.get("code")
+            message = self._extract_message(payload) or "unknown"
+            qr_url = None
+            data = payload.get("data")
+            if isinstance(data, dict):
+                qr_url = self._extract_qr_url(data)
+            if not qr_url:
+                qr_url = self._extract_qr_url(payload)
+
+            if code in (0, "0", None):
+                if qr_url:
+                    self._log(f"二维码已通过刷新接口更新 | 接口: {endpoint}", level="INFO")
+                    return qr_url, None
+                errors.append(f"{endpoint}: 刷新成功但未返回二维码链接")
+                continue
+
+            errors.append(f"{endpoint}: code={code}, message={message}")
+
+        if errors:
+            return None, " | ".join(errors)
+        return None, None
 
     @classmethod
     def _extract_qr_url(cls, payload: dict[str, Any]) -> str | None:
@@ -556,6 +626,7 @@ class NapcatKeeperPlugin(Star):
 
         self._last_qr_url = qr_url
         self._last_qr_image_path = image_path
+        self._last_qr_generated_at = time.monotonic()
 
         if success_count == 0:
             self._log("二维码通知未通过任何 UMO 发送成功。", level="WARNING")
@@ -575,7 +646,7 @@ class NapcatKeeperPlugin(Star):
             "NapCat 扫码登录二维码\n"
             f"时间: {self._now_text()}\n"
             f"触发: {trigger}\n"
-            "说明: 请在 2 分钟内扫码登录，过期可发送 /qr 刷新\n"
+            f"说明: 请在 {QR_EXPIRE_HINT_SECONDS // 60} 分钟内扫码登录，过期可发送 /qr 刷新\n"
             f"原因: {reason}\n"
             f"二维码链接: {qr_url}"
         )

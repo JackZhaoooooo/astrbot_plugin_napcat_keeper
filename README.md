@@ -8,6 +8,7 @@
 - 检测到退出登录时，向配置 UMO 列表发送离线通知
 - 支持自动获取 NapCat 二维码链接，生成二维码图片并推送到 UMO 列表
 - 支持手动命令 `/qr` 强制刷新并推送最新二维码
+- 推送二维码前会先调用 NapCat 刷新二维码会话接口，尽量避免发送过期二维码
 - 优先走 WebUI 接口（`/api/auth/login` + `/api/QQLogin/CheckLoginStatus`），失败时回退 onebot `get_login_info`
 
 ## 配置项

@@ -481,6 +481,21 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin._send_qr_notifications_for_state.await_count, 1)
         call = plugin._send_qr_notifications_for_state.await_args
         self.assertEqual(call.kwargs["trigger"], "自动检测")
+        self.assertTrue(call.kwargs["force_refresh"])
+
+    async def test_fetch_qr_login_url_force_refresh_uses_refresh_endpoint(self):
+        plugin = self.make_plugin()
+        plugin._request_webui_credential = AsyncMock(return_value=("cred", None))
+        plugin._refresh_qr_code = AsyncMock(
+            return_value=("https://txz.qq.com/p?k=refreshed&f=1600001615", None)
+        )
+        plugin._post_json = AsyncMock()
+
+        qr_url, error = await plugin._fetch_qr_login_url(force_refresh=True)
+
+        self.assertIsNone(error)
+        self.assertEqual(qr_url, "https://txz.qq.com/p?k=refreshed&f=1600001615")
+        self.assertEqual(plugin._post_json.await_count, 0)
 
 
 if __name__ == "__main__":
