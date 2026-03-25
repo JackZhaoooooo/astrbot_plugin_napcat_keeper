@@ -1231,6 +1231,30 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("collect", order)
         self.assertLess(order.index("auto_login"), order.index("collect"))
 
+    async def test_stop_napcat_related_processes_kills_launcher_and_qq_processes(self):
+        plugin = self.make_plugin(
+            {
+                "launcher_script": "/root/AstrBot/napcat/launcher.sh",
+            }
+        )
+
+        with patch.object(self.module.subprocess, "run") as run_mock, patch.object(
+            self.module.asyncio,
+            "sleep",
+            new=AsyncMock(),
+        ):
+            await plugin._stop_napcat_related_processes()
+
+        called_patterns = [call.args[0][2] for call in run_mock.call_args_list]
+        self.assertIn("/root/AstrBot/napcat/launcher.sh", called_patterns)
+        self.assertIn("loadNapCat.js", called_patterns)
+        self.assertIn("napcat.mjs", called_patterns)
+        self.assertIn("libnapcat_launcher.so", called_patterns)
+        self.assertIn("Xvfb :1", called_patterns)
+        self.assertIn("/opt/QQ/qq", called_patterns)
+        self.assertIn("qq", called_patterns)
+        self.assertIn("QQ", called_patterns)
+
     async def test_recover_for_snapshot_uses_login_only_recovery_when_service_is_online(self):
         plugin = self.make_plugin()
         snapshot = self.make_snapshot(

@@ -2365,16 +2365,9 @@ class NapcatKeeperPlugin(Star):
         self._log("=" * 50)
 
         try:
-            self._log("[1/6] 终止 QQ 进程...")
-            subprocess.run(["pkill", "-f", "qq"], check=False, stderr=subprocess.DEVNULL)
-            await asyncio.sleep(2)
-            subprocess.run(
-                ["pkill", "-9", "-f", "QQ"],
-                check=False,
-                stderr=subprocess.DEVNULL,
-            )
-            await asyncio.sleep(1)
-            self._log("[1/6] ✓ 进程已终止")
+            self._log("[1/6] 终止 NapCat / QQ 相关进程...")
+            await self._stop_napcat_related_processes()
+            self._log("[1/6] ✓ NapCat / QQ 相关进程已终止")
 
             self._log("[2/6] 清理残留状态...")
             await self._clear_login_state()
@@ -2493,6 +2486,44 @@ class NapcatKeeperPlugin(Star):
 
         except Exception as e:
             self._log(f"恢复失败: {e}", "ERROR", exc_info=True)
+
+    async def _stop_napcat_related_processes(self):
+        """终止本地 NapCat 与 QQ 相关进程，避免重启时残留旧实例。"""
+        patterns = [
+            str(self.launcher_script or "").strip(),
+            "loadNapCat.js",
+            "napcat.mjs",
+            "libnapcat_launcher.so",
+            "Xvfb :1",
+            "/opt/QQ/qq",
+            "qq --no-sandbox",
+            "qq",
+            "QQ",
+        ]
+
+        normalized_patterns: list[str] = []
+        seen_patterns: set[str] = set()
+        for pattern in patterns:
+            if not pattern or pattern in seen_patterns:
+                continue
+            seen_patterns.add(pattern)
+            normalized_patterns.append(pattern)
+
+        for pattern in normalized_patterns:
+            subprocess.run(
+                ["pkill", "-f", pattern],
+                check=False,
+                stderr=subprocess.DEVNULL,
+            )
+        await asyncio.sleep(2)
+
+        for pattern in normalized_patterns:
+            subprocess.run(
+                ["pkill", "-9", "-f", pattern],
+                check=False,
+                stderr=subprocess.DEVNULL,
+            )
+        await asyncio.sleep(1)
 
     async def _clear_login_state(self):
         """清理登录状态。"""
