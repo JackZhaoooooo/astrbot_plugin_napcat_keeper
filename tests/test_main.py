@@ -1638,6 +1638,63 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
             {"keep_manual_pending": True},
         )
 
+    async def test_prepare_manual_login_assistance_reuses_cached_captcha_urls(self):
+        plugin = self.make_plugin()
+        original_until = 9999999999.0
+        plugin._manual_login_pending_until = original_until
+        plugin._manual_login_pending_reason = "QQ 密码登录需要验证码。"
+        plugin._manual_login_pending_context = {
+            "account": "123456789",
+            "manual_kind": "captcha",
+            "proof_url": "https://example.com/original-captcha",
+            "qrcode_url": "https://example.com/original-qr",
+        }
+        plugin._fetch_login_qrcode = AsyncMock()
+        plugin._log = lambda *args, **kwargs: None
+
+        detail = await plugin._prepare_manual_login_assistance(
+            object(),
+            "credential-123",
+            "123456789",
+            "QQ 密码登录需要验证码，当前无法自动完成后续步骤。 | 验证地址: https://example.com/new-captcha",
+            notify=False,
+        )
+
+        self.assertIn("https://example.com/original-captcha", detail)
+        self.assertIn("https://example.com/original-qr", detail)
+        self.assertNotIn("https://example.com/new-captcha", detail)
+        self.assertEqual(plugin._fetch_login_qrcode.await_count, 0)
+        self.assertEqual(plugin._manual_login_pending_until, original_until)
+        self.assertEqual(
+            plugin._manual_login_pending_context["qrcode_url"],
+            "https://example.com/original-qr",
+        )
+
+    async def test_prepare_manual_login_assistance_reuses_cached_qr_url_without_refresh(self):
+        plugin = self.make_plugin()
+        original_until = 9999999999.0
+        plugin._manual_login_pending_until = original_until
+        plugin._manual_login_pending_reason = "登录态已失效，请重新登录。"
+        plugin._manual_login_pending_context = {
+            "account": "123456789",
+            "manual_kind": "relogin",
+            "qrcode_url": "https://example.com/original-qr",
+        }
+        plugin._fetch_login_qrcode = AsyncMock()
+        plugin._log = lambda *args, **kwargs: None
+
+        detail = await plugin._prepare_manual_login_assistance(
+            object(),
+            "credential-123",
+            "123456789",
+            "触发快速登录失败: 登录态已失效，请重新登录。",
+            notify=False,
+        )
+
+        self.assertIn("https://example.com/original-qr", detail)
+        self.assertEqual(plugin._fetch_login_qrcode.await_count, 0)
+        self.assertEqual(plugin._manual_login_pending_until, original_until)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -534,6 +534,85 @@ class NapcatKeeperPlugin(Star):
             ]
         )
 
+    @staticmethod
+    def _classify_manual_login_kind(detail: str | None) -> str:
+        lowered = str(detail or "").lower()
+        if "新设备验证" in lowered or "jumpurl" in lowered:
+            return "new_device"
+        if "验证码" in lowered or "captcha" in lowered or "proofwater" in lowered:
+            return "captcha"
+        if "重新登录" in lowered or "登录态已失效" in lowered:
+            return "relogin"
+        return "manual"
+
+    def _get_reusable_manual_login_context(
+        self,
+        *,
+        account: str,
+        manual_kind: str,
+    ) -> dict[str, Any]:
+        if not self._is_manual_login_pending():
+            return {}
+
+        context = dict(self._manual_login_pending_context)
+        if context.get("account") != account:
+            return {}
+        if context.get("manual_kind") != manual_kind:
+            return {}
+        return context
+
+    @staticmethod
+    def _apply_manual_login_context_to_detail(
+        detail: str,
+        context: dict[str, Any] | None,
+    ) -> str:
+        if not context:
+            return detail
+
+        updated_detail = detail
+        proof_url = context.get("proof_url")
+        current_first_url = NapcatKeeperPlugin._extract_first_url(updated_detail)
+        manual_kind = context.get("manual_kind")
+        if (
+            proof_url
+            and current_first_url
+            and current_first_url != proof_url
+            and manual_kind in {"captcha", "new_device"}
+        ):
+            updated_detail = updated_detail.replace(current_first_url, proof_url, 1)
+
+        if proof_url and proof_url not in updated_detail:
+            updated_detail = NapcatKeeperPlugin._append_detail(
+                updated_detail,
+                f"验证地址: {proof_url}",
+            )
+
+        qrcode_url = context.get("qrcode_url")
+        if qrcode_url and qrcode_url not in updated_detail:
+            updated_detail = NapcatKeeperPlugin._append_detail(
+                updated_detail,
+                f"二维码地址: {qrcode_url}",
+            )
+        return updated_detail
+
+    def _update_manual_login_pending(
+        self,
+        detail: str,
+        *,
+        context: dict[str, Any] | None = None,
+        preserve_window: bool = False,
+    ):
+        merged_context = dict(self._manual_login_pending_context)
+        if context:
+            merged_context.update(context)
+
+        if preserve_window and self._is_manual_login_pending():
+            self._manual_login_pending_reason = detail
+            self._manual_login_pending_context = merged_context
+            return
+
+        self._enter_manual_login_pending(detail, context=merged_context)
+
     def _clear_manual_login_pending(self):
         self._manual_login_pending_until = 0.0
         self._manual_login_pending_reason = ""
@@ -678,30 +757,33 @@ class NapcatKeeperPlugin(Star):
         self,
         session: aiohttp.ClientSession,
         credential: str,
+        *,
+        refresh: bool = True,
     ) -> tuple[str | None, str]:
         refresh_endpoint = self._build_webui_api_url("/QQLogin/RefreshQRcode")
         refresh_note = ""
-        try:
-            (
-                refresh_endpoint,
-                refresh_code,
-                refresh_payload,
-                refresh_raw_text,
-            ) = await self._call_webui_api(
-                session,
-                "/QQLogin/RefreshQRcode",
-                credential=credential,
-            )
-            if refresh_payload is not None and not self._is_webui_success(refresh_payload):
-                refresh_message = self._extract_webui_message(refresh_payload)
-                if not self._looks_like_already_logged_in(refresh_message):
-                    refresh_note = (
-                        f"刷新二维码未成功: "
-                        f"{self._build_webui_error_detail('RefreshQRcode 失败', refresh_payload, refresh_raw_text)}"
-                        f" | 接口: {refresh_endpoint} | HTTP {refresh_code}"
-                    )
-        except Exception as e:
-            refresh_note = f"刷新二维码异常: {e} | 接口: {refresh_endpoint}"
+        if refresh:
+            try:
+                (
+                    refresh_endpoint,
+                    refresh_code,
+                    refresh_payload,
+                    refresh_raw_text,
+                ) = await self._call_webui_api(
+                    session,
+                    "/QQLogin/RefreshQRcode",
+                    credential=credential,
+                )
+                if refresh_payload is not None and not self._is_webui_success(refresh_payload):
+                    refresh_message = self._extract_webui_message(refresh_payload)
+                    if not self._looks_like_already_logged_in(refresh_message):
+                        refresh_note = (
+                            f"刷新二维码未成功: "
+                            f"{self._build_webui_error_detail('RefreshQRcode 失败', refresh_payload, refresh_raw_text)}"
+                            f" | 接口: {refresh_endpoint} | HTTP {refresh_code}"
+                        )
+            except Exception as e:
+                refresh_note = f"刷新二维码异常: {e} | 接口: {refresh_endpoint}"
 
         (
             endpoint,
@@ -801,72 +883,104 @@ class NapcatKeeperPlugin(Star):
         notify: bool = True,
     ) -> str:
         assisted_detail = detail
-        context: dict[str, Any] = {}
+        manual_kind = self._classify_manual_login_kind(detail)
+        reusable_context = (
+            self._get_reusable_manual_login_context(
+                account=account,
+                manual_kind=manual_kind,
+            )
+            if not notify
+            else {}
+        )
+        context: dict[str, Any] = dict(reusable_context)
+        context["account"] = account
+        context["manual_kind"] = manual_kind
         first_url = self._extract_first_url(detail)
-        if first_url:
+        if first_url and not context.get("proof_url"):
             context["proof_url"] = first_url
 
         if "新设备验证" in detail and first_url:
-            try:
-                qrcode_url, qrcode_detail = await self._fetch_new_device_qrcode(
-                    session,
-                    credential,
-                    account,
-                    first_url,
-                )
-                if qrcode_url:
-                    context["qrcode_url"] = qrcode_url
-                    assisted_detail = self._append_detail(
-                        assisted_detail,
-                        f"已获取新设备验证二维码，可直接扫码确认: {qrcode_url}",
-                    )
-                    self._log(
-                        "QQ 登录触发新设备验证，已获取辅助二维码。"
-                        f" | 账号: {account} | 二维码: {qrcode_url}"
-                    )
-                else:
-                    assisted_detail = self._append_detail(
-                        assisted_detail,
-                        f"新设备二维码获取失败: {qrcode_detail}",
-                    )
-            except Exception as e:
+            if context.get("qrcode_url"):
                 assisted_detail = self._append_detail(
                     assisted_detail,
-                    f"新设备二维码获取异常: {e}",
+                    f"沿用已有新设备验证二维码: {context['qrcode_url']}",
                 )
+            else:
+                try:
+                    qrcode_url, qrcode_detail = await self._fetch_new_device_qrcode(
+                        session,
+                        credential,
+                        account,
+                        first_url,
+                    )
+                    if qrcode_url:
+                        context["qrcode_url"] = qrcode_url
+                        assisted_detail = self._append_detail(
+                            assisted_detail,
+                            f"已获取新设备验证二维码，可直接扫码确认: {qrcode_url}",
+                        )
+                        self._log(
+                            "QQ 登录触发新设备验证，已获取辅助二维码。"
+                            f" | 账号: {account} | 二维码: {qrcode_url}"
+                        )
+                    else:
+                        assisted_detail = self._append_detail(
+                            assisted_detail,
+                            f"新设备二维码获取失败: {qrcode_detail}",
+                        )
+                except Exception as e:
+                    assisted_detail = self._append_detail(
+                        assisted_detail,
+                        f"新设备二维码获取异常: {e}",
+                    )
         elif self.auto_qr_login_fallback:
-            try:
-                qrcode_url, qrcode_detail = await self._fetch_login_qrcode(
-                    session,
-                    credential,
-                )
-                if qrcode_url:
-                    context["qrcode_url"] = qrcode_url
-                    assisted_detail = self._append_detail(
-                        assisted_detail,
-                        f"可改用二维码登录 NapCat: {qrcode_url}",
-                    )
-                    self._log(
-                        "已获取 QQ 登录二维码，自动登录流程改为等待扫码确认。"
-                        f" | 账号: {account} | 二维码: {qrcode_url}"
-                    )
-                else:
-                    assisted_detail = self._append_detail(
-                        assisted_detail,
-                        f"二维码登录兜底失败: {qrcode_detail}",
-                    )
-            except Exception as e:
+            if context.get("qrcode_url"):
                 assisted_detail = self._append_detail(
                     assisted_detail,
-                    f"二维码登录兜底异常: {e}",
+                    f"沿用已有二维码登录地址: {context['qrcode_url']}",
                 )
+            else:
+                try:
+                    qrcode_url, qrcode_detail = await self._fetch_login_qrcode(
+                        session,
+                        credential,
+                        refresh=notify,
+                    )
+                    if qrcode_url:
+                        context["qrcode_url"] = qrcode_url
+                        assisted_detail = self._append_detail(
+                            assisted_detail,
+                            f"可改用二维码登录 NapCat: {qrcode_url}",
+                        )
+                        self._log(
+                            "已获取 QQ 登录二维码，自动登录流程改为等待扫码确认。"
+                            f" | 账号: {account} | 二维码: {qrcode_url}"
+                        )
+                    else:
+                        assisted_detail = self._append_detail(
+                            assisted_detail,
+                            f"二维码登录兜底失败: {qrcode_detail}",
+                        )
+                except Exception as e:
+                    assisted_detail = self._append_detail(
+                        assisted_detail,
+                        f"二维码登录兜底异常: {e}",
+                    )
 
+        assisted_detail = self._apply_manual_login_context_to_detail(
+            assisted_detail,
+            context,
+        )
         assisted_detail = self._append_detail(
             assisted_detail,
             "插件将进入人工登录等待模式，"
             f"在接下来的 {self._format_wait_seconds(self.manual_login_cooldown_seconds)} 内仅轮询登录状态。",
         )
-        self._enter_manual_login_pending(assisted_detail, context=context)
+        self._update_manual_login_pending(
+            assisted_detail,
+            context=context,
+            preserve_window=not notify,
+        )
         if notify:
             await self._notify_manual_login_required(
                 assisted_detail,
