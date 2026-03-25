@@ -33,6 +33,7 @@ RECOVERY_VERIFY_INTERVAL_SECONDS = 2
 RECOVERY_VERIFY_ATTEMPTS_WITH_AUTO_LOGIN = 8
 RECOVERY_VERIFY_ATTEMPTS_DEFAULT = 4
 MANUAL_LOGIN_COOLDOWN_SECONDS_DEFAULT = 900
+MANUAL_LOGIN_RETRY_INTERVAL_SECONDS_DEFAULT = 20
 STATUS_TEXT = {
     "online": "🟢 在线",
     "offline": "🟡 未登录",
@@ -149,6 +150,14 @@ class NapcatKeeperPlugin(Star):
             default=MANUAL_LOGIN_COOLDOWN_SECONDS_DEFAULT,
             minimum=0,
         )
+        self.manual_login_retry_interval_seconds = self._parse_int(
+            config.get(
+                "manual_login_retry_interval_seconds",
+                MANUAL_LOGIN_RETRY_INTERVAL_SECONDS_DEFAULT,
+            ),
+            default=MANUAL_LOGIN_RETRY_INTERVAL_SECONDS_DEFAULT,
+            minimum=0,
+        )
 
         self._consecutive_failures = 0
         self._is_monitoring = False
@@ -162,6 +171,7 @@ class NapcatKeeperPlugin(Star):
         self._manual_login_pending_until = 0.0
         self._manual_login_pending_reason = ""
         self._manual_login_pending_context: dict[str, Any] = {}
+        self._manual_login_last_retry_at = 0.0
         self._log("=" * 50)
         self._log("NapcatKeeper 插件初始化")
         self._log(f"NapCat URL: {self.napcat_url}")
@@ -192,6 +202,7 @@ class NapcatKeeperPlugin(Star):
             f"二维码登录兜底: {'启用' if self.auto_qr_login_fallback else '禁用'}"
         )
         self._log(f"人工登录冷却: {self.manual_login_cooldown_seconds} 秒")
+        self._log(f"人工登录续登重试间隔: {self.manual_login_retry_interval_seconds} 秒")
         self._log("=" * 50)
 
     def _log(self, msg: str, level: str = "INFO", *, exc_info=False):
@@ -527,6 +538,7 @@ class NapcatKeeperPlugin(Star):
         self._manual_login_pending_until = 0.0
         self._manual_login_pending_reason = ""
         self._manual_login_pending_context = {}
+        self._manual_login_last_retry_at = 0.0
 
     def _is_manual_login_pending(self) -> bool:
         if self._manual_login_pending_until <= 0:
@@ -555,6 +567,7 @@ class NapcatKeeperPlugin(Star):
         self._manual_login_pending_until = time.monotonic() + cooldown
         self._manual_login_pending_reason = detail
         self._manual_login_pending_context = dict(context or {})
+        self._manual_login_last_retry_at = time.monotonic()
         self._consecutive_failures = 0
         self._log(
             "已进入人工登录等待模式，后续仅轮询登录状态，暂不重复重启 NapCat。"
@@ -567,6 +580,19 @@ class NapcatKeeperPlugin(Star):
         if not self._is_manual_login_pending():
             return False
         return snapshot.service.state == "online" and snapshot.overall_status != "online"
+
+    def _should_retry_manual_login_pending(self) -> bool:
+        if not self._is_manual_login_pending():
+            return False
+        retry_interval = max(0, int(self.manual_login_retry_interval_seconds))
+        if retry_interval == 0:
+            return True
+        return (
+            time.monotonic() - self._manual_login_last_retry_at >= retry_interval
+        )
+
+    def _mark_manual_login_retry(self):
+        self._manual_login_last_retry_at = time.monotonic()
 
     async def _notify_manual_login_required(
         self,
@@ -610,6 +636,43 @@ class NapcatKeeperPlugin(Star):
         if not delivered:
             self._log("登录辅助通知未通过任何 UMO 发送成功。", "WARNING")
         return delivered
+
+    async def _handle_manual_login_pending_snapshot(
+        self,
+        snapshot: StatusSnapshot,
+        current_time: str,
+    ) -> bool:
+        if not self._should_hold_manual_login_pending(snapshot):
+            return False
+
+        remaining_seconds = self._manual_login_pending_remaining_seconds()
+        hold_level = "WARNING" if snapshot.overall_status == "offline" else "ERROR"
+
+        if (
+            self.enable_auto_login
+            and self.qq_account
+            and self._should_retry_manual_login_pending()
+        ):
+            self._mark_manual_login_retry()
+            self._log(
+                f"[{current_time}] 当前处于人工登录等待期，"
+                "开始执行轻量续登重试，不重启 NapCat。"
+                f" | 剩余等待: {self._format_wait_seconds(remaining_seconds)}"
+                f" | 原因: {self._manual_login_pending_reason}",
+                hold_level,
+            )
+            await self._recover_login_only(snapshot, keep_manual_pending=True)
+            return True
+
+        self._consecutive_failures = 0
+        self._log(
+            f"[{current_time}] 当前处于人工登录等待期，"
+            f"剩余 {self._format_wait_seconds(remaining_seconds)}，"
+            "本轮跳过自动恢复。"
+            f" | 原因: {self._manual_login_pending_reason}",
+            hold_level,
+        )
+        return True
 
     async def _fetch_login_qrcode(
         self,
@@ -734,6 +797,8 @@ class NapcatKeeperPlugin(Star):
         credential: str,
         account: str,
         detail: str,
+        *,
+        notify: bool = True,
     ) -> str:
         assisted_detail = detail
         context: dict[str, Any] = {}
@@ -802,11 +867,18 @@ class NapcatKeeperPlugin(Star):
             f"在接下来的 {self._format_wait_seconds(self.manual_login_cooldown_seconds)} 内仅轮询登录状态。",
         )
         self._enter_manual_login_pending(assisted_detail, context=context)
-        await self._notify_manual_login_required(
-            assisted_detail,
-            account=account,
-            context=context,
-        )
+        if notify:
+            await self._notify_manual_login_required(
+                assisted_detail,
+                account=account,
+                context=context,
+            )
+        else:
+            self._log(
+                "人工登录等待期内仍检测到需要人工处理，保持等待状态并跳过重复通知。"
+                f" | 账号: {account} | 原因: {assisted_detail}",
+                "WARNING",
+            )
         return assisted_detail
 
     async def _post_json_request(
@@ -1475,19 +1547,10 @@ class NapcatKeeperPlugin(Star):
                         )
                     self._consecutive_failures = 0
                 else:
-                    if self._should_hold_manual_login_pending(snapshot):
-                        remaining_seconds = self._manual_login_pending_remaining_seconds()
-                        self._consecutive_failures = 0
-                        hold_level = (
-                            "WARNING" if snapshot.overall_status == "offline" else "ERROR"
-                        )
-                        self._log(
-                            f"[{current_time}] 当前处于人工登录等待期，"
-                            f"剩余 {self._format_wait_seconds(remaining_seconds)}，"
-                            "本轮跳过自动恢复。"
-                            f" | 原因: {self._manual_login_pending_reason}",
-                            hold_level,
-                        )
+                    if await self._handle_manual_login_pending_snapshot(
+                        snapshot,
+                        current_time,
+                    ):
                         await asyncio.sleep(self.check_interval)
                         continue
 
@@ -1927,10 +1990,16 @@ class NapcatKeeperPlugin(Star):
             f"已为 QQ {account} 提交密码登录请求。 | 接口: {endpoint}",
         )
 
-    async def _auto_login_qq(self) -> AutoLoginAttemptResult:
+    async def _auto_login_qq(
+        self,
+        *,
+        reset_manual_pending: bool = True,
+        notify_manual_action: bool = True,
+    ) -> AutoLoginAttemptResult:
         account = str(self.qq_account or "").strip()
         password = str(self.qq_password or "").strip()
-        self._clear_manual_login_pending()
+        if reset_manual_pending:
+            self._clear_manual_login_pending()
         if not self.enable_auto_login:
             result = AutoLoginAttemptResult(
                 submitted=False,
@@ -1970,6 +2039,7 @@ class NapcatKeeperPlugin(Star):
                             credential,
                             account,
                             password_detail,
+                            notify=notify_manual_action,
                         )
                         success = False
                     else:
@@ -2008,6 +2078,7 @@ class NapcatKeeperPlugin(Star):
                             credential,
                             account,
                             detail,
+                            notify=notify_manual_action,
                         )
         except (ValueError, RuntimeError) as e:
             result = AutoLoginAttemptResult(
@@ -2174,7 +2245,12 @@ class NapcatKeeperPlugin(Star):
             return
         await self._recover_napcat()
 
-    async def _recover_login_only(self, snapshot: StatusSnapshot | None = None):
+    async def _recover_login_only(
+        self,
+        snapshot: StatusSnapshot | None = None,
+        *,
+        keep_manual_pending: bool = False,
+    ):
         """NapCat 服务仍在线时，仅执行 QQ 重新登录流程。"""
         self._webui_credential = None
         self._webui_credential_cached_at = 0.0
@@ -2199,7 +2275,10 @@ class NapcatKeeperPlugin(Star):
             )
             if self.enable_auto_login and self.qq_account:
                 self._log("[登录恢复] 开始执行 QQ 自动登录...")
-                auto_login_result = await self._auto_login_qq()
+                auto_login_result = await self._auto_login_qq(
+                    reset_manual_pending=not keep_manual_pending,
+                    notify_manual_action=not keep_manual_pending,
+                )
                 if auto_login_result.submitted:
                     self._log(
                         "[登录恢复] ✓ QQ 自动登录已提交，进入快速验证阶段。"

@@ -98,6 +98,12 @@
         "hint": "需要验证码或扫码时，冷却期内仅轮询登录状态，不重复重启 NapCat",
         "default": 900
     },
+    "manual_login_retry_interval_seconds": {
+        "description": "人工登录续登重试间隔（秒）",
+        "type": "int",
+        "hint": "等待验证码/扫码完成后，插件会按此间隔自动重新提交登录，但不会重启 NapCat",
+        "default": 20
+    },
     "debug": {
         "description": "调试日志",
         "type": "bool",

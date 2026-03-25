@@ -39,6 +39,7 @@
 | `manual_login_notify_umos` | `[]` | QQ 登录需要人工验证/扫码时主动通知的 UMO 列表；留空则默认复用登录态通知目标 |
 | `auto_qr_login_fallback` | `true` | 当密码登录触发验证码、快速登录提示重新登录时，自动尝试获取 NapCat 二维码登录链接 |
 | `manual_login_cooldown_seconds` | `900` | 登录需要人工处理时的冷却时长；冷却期内只轮询状态，不重复重启 NapCat |
+| `manual_login_retry_interval_seconds` | `20` | 人工验证等待期内的续登重试间隔；验证完成后插件会按此间隔自动重新提交登录，但不会重启 NapCat |
 | `debug` | `false` | 开启后输出全部巡检日志；关闭后隐藏正常在线的轮询日志，但保留恢复和重新登录过程日志 |
 
 ## 安装
@@ -79,7 +80,7 @@ git clone https://github.com/JackZhaoooooo/astrbot_plugin_napcat_keeper.git
 3. 连续失败达到 `max_retries` 次后触发自动恢复
 4. 如果 NapCat 服务仍在线，仅执行 QQ 重新登录流程，不再整套重启
 5. 如果密码登录触发验证码/新设备验证，插件会尝试获取验证链接或二维码，并进入人工登录等待模式
-6. 冷却期内插件只轮询登录状态，不重复重启 NapCat，等待你完成扫码或验证
+6. 冷却期内插件不会重启 NapCat，但会按配置间隔自动重新提交登录，适合你完成短信验证或扫码后自动续登
 
 ## 注意事项
 

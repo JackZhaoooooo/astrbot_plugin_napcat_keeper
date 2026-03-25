@@ -1301,14 +1301,14 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
             login_detail="WebUI 检测到当前未登录 QQ。",
         )
 
-        async def auto_login():
+        async def auto_login(**kwargs):
             order.append("auto_login")
             return self.module.AutoLoginAttemptResult(
                 submitted=True,
                 detail="已为 QQ 123456789 提交快速登录请求。",
             )
 
-        async def collect_snapshot():
+        async def verify_snapshot(**kwargs):
             order.append("collect")
             return self.make_snapshot(
                 "online",
@@ -1320,8 +1320,7 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
             )
 
         plugin._auto_login_qq = AsyncMock(side_effect=auto_login)
-        plugin._collect_status_snapshot = AsyncMock(side_effect=collect_snapshot)
-        plugin._emit_snapshot_logs = lambda *args, **kwargs: order.append("emit")
+        plugin._verify_recovery_status = AsyncMock(side_effect=verify_snapshot)
         plugin._log = lambda *args, **kwargs: None
 
         with patch.object(
@@ -1334,6 +1333,39 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("auto_login", order)
         self.assertIn("collect", order)
         self.assertLess(order.index("auto_login"), order.index("collect"))
+
+    async def test_recover_login_only_keeps_manual_pending_during_retry(self):
+        plugin = self.make_plugin(
+            {
+                "enable_auto_login": True,
+                "qq_account": "123456789",
+            }
+        )
+        offline_snapshot = self.make_snapshot(
+            "offline",
+            login_state="not_logged_in",
+            login_detail="WebUI 检测到当前未登录 QQ。",
+        )
+        plugin._auto_login_qq = AsyncMock(
+            return_value=self.module.AutoLoginAttemptResult(
+                submitted=False,
+                detail="仍需人工处理。",
+                manual_action_required=True,
+            )
+        )
+        plugin._verify_recovery_status = AsyncMock(return_value=offline_snapshot)
+        plugin._log = lambda *args, **kwargs: None
+
+        await plugin._recover_login_only(offline_snapshot, keep_manual_pending=True)
+
+        self.assertEqual(plugin._auto_login_qq.await_count, 1)
+        self.assertEqual(
+            plugin._auto_login_qq.await_args.kwargs,
+            {
+                "reset_manual_pending": False,
+                "notify_manual_action": False,
+            },
+        )
 
     async def test_recover_napcat_skips_repeated_retry_when_auto_login_needs_manual_action(self):
         plugin = self.make_plugin(
@@ -1541,6 +1573,70 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         message = results[0]
         self.assertIn("人工登录等待", message)
         self.assertIn("QQ 密码登录需要验证码", message)
+
+    async def test_handle_manual_login_pending_snapshot_skips_retry_before_interval(self):
+        plugin = self.make_plugin(
+            {
+                "enable_auto_login": True,
+                "qq_account": "123456789",
+                "manual_login_retry_interval_seconds": 20,
+            }
+        )
+        snapshot = self.make_snapshot(
+            "offline",
+            login_state="not_logged_in",
+            login_detail="WebUI 检测到当前未登录 QQ。",
+        )
+        plugin._manual_login_pending_until = 200.0
+        plugin._manual_login_pending_reason = "QQ 密码登录需要验证码。"
+        plugin._manual_login_last_retry_at = 100.0
+        plugin._recover_login_only = AsyncMock()
+        captured = []
+        plugin._log = lambda message, level="INFO", **kwargs: captured.append(
+            (level, message, kwargs)
+        )
+
+        with patch.object(self.module.time, "monotonic", return_value=110.0):
+            handled = await plugin._handle_manual_login_pending_snapshot(
+                snapshot,
+                "2026-03-25 12:00:00",
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(plugin._recover_login_only.await_count, 0)
+        self.assertTrue(any("本轮跳过自动恢复" in item[1] for item in captured))
+
+    async def test_handle_manual_login_pending_snapshot_retries_login_only_when_due(self):
+        plugin = self.make_plugin(
+            {
+                "enable_auto_login": True,
+                "qq_account": "123456789",
+                "manual_login_retry_interval_seconds": 20,
+            }
+        )
+        snapshot = self.make_snapshot(
+            "offline",
+            login_state="not_logged_in",
+            login_detail="WebUI 检测到当前未登录 QQ。",
+        )
+        plugin._manual_login_pending_until = 200.0
+        plugin._manual_login_pending_reason = "QQ 密码登录需要验证码。"
+        plugin._manual_login_last_retry_at = 100.0
+        plugin._recover_login_only = AsyncMock()
+        plugin._log = lambda *args, **kwargs: None
+
+        with patch.object(self.module.time, "monotonic", return_value=130.0):
+            handled = await plugin._handle_manual_login_pending_snapshot(
+                snapshot,
+                "2026-03-25 12:00:00",
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(plugin._recover_login_only.await_count, 1)
+        self.assertEqual(
+            plugin._recover_login_only.await_args.kwargs,
+            {"keep_manual_pending": True},
+        )
 
 
 if __name__ == "__main__":
