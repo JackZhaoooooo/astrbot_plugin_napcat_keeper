@@ -1009,15 +1009,52 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("NapCat 端尚未完成登录", detail)
         self.assertIn("无法重复登录", detail)
 
-    async def test_auto_login_qq_generates_qrcode_when_enabled(self):
+    async def test_auto_login_qq_uses_password_login_when_password_configured(self):
         plugin = self.make_plugin(
             {
                 "enable_auto_login": True,
                 "qq_account": "123456789",
                 "napcat_token": "token123",
+                "qq_password": "pass123",
             }
         )
         plugin._request_webui_credential = AsyncMock(return_value="credential-123")
+        plugin._password_login_by_account = AsyncMock(
+            return_value=(True, "已为 QQ 123456789 提交密码登录请求。")
+        )
+        plugin._prepare_manual_login_assistance = AsyncMock()
+        plugin._log = lambda *args, **kwargs: None
+
+        result = await plugin._auto_login_qq()
+
+        self.assertTrue(result.submitted)
+        self.assertFalse(result.manual_action_required)
+        self.assertEqual(result.level, "INFO")
+        self.assertIn("QQ 普通登录已提交", result.detail)
+        self.assertEqual(plugin._request_webui_credential.await_count, 1)
+        self.assertEqual(plugin._password_login_by_account.await_count, 1)
+        self.assertEqual(plugin._prepare_manual_login_assistance.await_count, 0)
+        self.assertEqual(
+            plugin._password_login_by_account.await_args.args[2:],
+            ("123456789", "pass123"),
+        )
+
+    async def test_auto_login_qq_switches_to_qrcode_when_password_login_requires_scan(self):
+        plugin = self.make_plugin(
+            {
+                "enable_auto_login": True,
+                "qq_account": "123456789",
+                "napcat_token": "token123",
+                "qq_password": "pass123",
+            }
+        )
+        plugin._request_webui_credential = AsyncMock(return_value="credential-123")
+        plugin._password_login_by_account = AsyncMock(
+            return_value=(
+                False,
+                "QQ 密码登录触发验证码校验，无法直接完成普通登录，需要切换为二维码登录。",
+            )
+        )
 
         async def prepare_side_effect(*_args, **_kwargs):
             plugin._manual_login_pending_context = {
@@ -1026,7 +1063,8 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
                 "qrcode_expires_at": 9999999999.0,
             }
             return (
-                "NapCat 当前未登录，需要扫码完成 QQ 登录。"
+                "QQ 普通登录未能直接完成，已切换为二维码登录。"
+                " | 原因: QQ 密码登录触发验证码校验，无法直接完成普通登录，需要切换为二维码登录。"
                 " | 已生成 QQ 登录二维码（2 分内有效）: https://txz.qq.com/p?k=abc"
             )
 
@@ -1036,32 +1074,32 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         result = await plugin._auto_login_qq()
 
         self.assertFalse(result.submitted)
-        self.assertEqual(result.level, "WARNING")
         self.assertTrue(result.manual_action_required)
+        self.assertEqual(result.level, "WARNING")
+        self.assertIn("QQ 普通登录未能直接完成", result.detail)
         self.assertIn("https://txz.qq.com/p?k=abc", result.detail)
-        self.assertEqual(plugin._request_webui_credential.await_count, 1)
-        self.assertEqual(plugin._prepare_manual_login_assistance.await_count, 1)
-        self.assertEqual(
-            plugin._prepare_manual_login_assistance.await_args.args[2],
-            "123456789",
-        )
+        self.assertEqual(plugin._password_login_by_account.await_count, 1)
+        self.assertEqual(plugin._prepare_manual_login_assistance.await_args.args[2], "123456789")
 
-    async def test_auto_login_qq_still_generates_qrcode_without_configured_account(self):
+    async def test_auto_login_qq_uses_qrcode_without_password(self):
         plugin = self.make_plugin(
             {
                 "enable_auto_login": True,
-                "qq_account": "",
+                "qq_account": "123456789",
             }
         )
         plugin._request_webui_credential = AsyncMock(return_value="credential-123")
 
         async def prepare_side_effect(*_args, **_kwargs):
             plugin._manual_login_pending_context = {
-                "account": "",
+                "account": "123456789",
                 "qrcode_url": "https://txz.qq.com/p?k=guest",
                 "qrcode_expires_at": 9999999999.0,
             }
-            return "已生成 QQ 登录二维码（2 分内有效）: https://txz.qq.com/p?k=guest"
+            return (
+                "未配置 qq_password，无法执行账号密码登录，已直接切换为二维码登录。"
+                " | 已生成 QQ 登录二维码（2 分内有效）: https://txz.qq.com/p?k=guest"
+            )
 
         plugin._prepare_manual_login_assistance = AsyncMock(side_effect=prepare_side_effect)
         plugin._log = lambda *args, **kwargs: None
@@ -1070,8 +1108,9 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result.submitted)
         self.assertTrue(result.manual_action_required)
+        self.assertEqual(result.level, "WARNING")
+        self.assertIn("未配置 qq_password", result.detail)
         self.assertIn("https://txz.qq.com/p?k=guest", result.detail)
-        self.assertEqual(plugin._prepare_manual_login_assistance.await_args.args[2], "")
 
     async def test_auto_login_qq_returns_error_when_qrcode_generation_fails(self):
         plugin = self.make_plugin(
@@ -1082,7 +1121,7 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         )
         plugin._request_webui_credential = AsyncMock(return_value="credential-123")
         plugin._prepare_manual_login_assistance = AsyncMock(
-            return_value="生成 QQ 登录二维码失败: 接口超时。"
+            return_value="未配置 qq_password，无法执行账号密码登录，已直接切换为二维码登录。 | 生成 QQ 登录二维码失败: 接口超时。"
         )
         plugin._log = lambda *args, **kwargs: None
 
