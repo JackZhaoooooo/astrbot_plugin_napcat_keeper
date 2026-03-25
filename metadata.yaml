@@ -1,9 +1,5 @@
 name: astrbot_plugin_napcat_keeper
-display_name: napcat保活
-version: 1.2.3
-author: AstrBot Community
-description: NapCat QQ 机器人保活插件，检测并自动恢复掉线状态
-repo: https://github.com/JackZhaoooooo/astrbot_plugin_napcat_keeper
-support_platforms:
-  - aiocqhttp
-astrbot_version: ">=4.16"
+desc: NapCat 登录保活与自动重登插件（支持密码登录与二维码通知）
+version: v5.0.0
+author: zzt
+repo: https://github.com/zzt-1/astrbot_plugin_napcat_keeper

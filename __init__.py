@@ -1,3 +1,1 @@
-"""
-NapCat Keeper - AstrBot 保活插件
-"""
+from .main import NapcatKeeperPlugin

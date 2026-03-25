@@ -1,107 +1,64 @@
 {
-    "napcat_url": {
-        "description": "NapCat WebUI 地址",
-        "type": "string",
-        "hint": "默认: http://localhost:6099",
-        "default": "http://localhost:6099"
-    },
-    "napcat_token": {
-        "description": "NapCat WebUI Token",
-        "type": "string",
-        "hint": "WebUI 登录密钥，留空则不验证",
-        "default": ""
-    },
-    "check_interval": {
-        "description": "状态检查间隔（秒）",
-        "type": "int",
-        "hint": "建议设置 30-120 秒",
-        "default": 60
-    },
-    "max_retries": {
-        "description": "连续失败重试次数阈值",
-        "type": "int",
-        "hint": "超过此次数后自动恢复 NapCat",
-        "default": 3
-    },
-    "napcat_dir": {
-        "description": "NapCat 安装目录",
-        "type": "string",
-        "hint": "默认: /root/AstrBot/napcat",
-        "default": "/root/AstrBot/napcat"
-    },
-    "launcher_script": {
-        "description": "NapCat 启动脚本路径",
-        "type": "string",
-        "hint": "默认: /root/AstrBot/napcat/launcher.sh",
-        "default": "/root/AstrBot/napcat/launcher.sh"
-    },
-    "enable_auto_restart": {
-        "description": "启用自动恢复功能",
-        "type": "bool",
-        "hint": "关闭后仅监控不自动恢复",
-        "default": true
-    },
-    "enable_auto_login": {
-        "description": "掉线后自动重新登录",
-        "type": "bool",
-        "hint": "开启后优先尝试账号密码登录，失败时自动切换为二维码登录；遇到 QQ Is Logined 会直接重启 NapCat",
-        "default": true
-    },
-    "qq_account": {
-        "description": "QQ 账号",
-        "type": "string",
-        "hint": "填写机器人 QQ 号；用于账号密码登录、二维码登录和日志展示",
-        "default": ""
-    },
-    "qq_password": {
-        "description": "QQ 密码（可选）",
-        "type": "string",
-        "hint": "已配置时优先走账号密码登录；失败后会自动切换到二维码登录",
-        "default": ""
-    },
-    "logout_notify_umos": {
-        "description": "退出登录通知",
-        "type": "list",
-        "hint": "填写一个或多个 UMO，会在 QQ 退出登录时主动通知",
-        "items": {
-            "type": "string"
-        },
-        "default": []
-    },
-    "relogin_notify_umos": {
-        "description": "重新登录通知",
-        "type": "list",
-        "hint": "填写一个或多个 UMO，会在 QQ 重新登录时主动通知",
-        "items": {
-            "type": "string"
-        },
-        "default": []
-    },
-    "manual_login_notify_umos": {
-        "description": "登录辅助通知",
-        "type": "list",
-        "hint": "当 QQ 登录需要扫码时主动通知；留空则默认复用退出/重新登录通知目标",
-        "items": {
-            "type": "string"
-        },
-        "default": []
-    },
-    "manual_login_cooldown_seconds": {
-        "description": "二维码登录等待时长（秒）",
-        "type": "int",
-        "hint": "等待扫码期间仅轮询登录状态，不重复重启 NapCat；二维码每 2 分钟自动刷新",
-        "default": 120
-    },
-    "debug": {
-        "description": "调试日志",
-        "type": "bool",
-        "hint": "开启后输出全部巡检日志；关闭后默认隐藏正常在线的轮询日志，但保留恢复和重新登录过程日志",
-        "default": false
-    },
-    "notify_on_restart": {
-        "description": "恢复后发送通知",
-        "type": "bool",
-        "hint": "自动恢复后通知管理员",
-        "default": true
-    }
+  "napcat_url": {
+    "description": "NapCat 根地址",
+    "type": "string",
+    "hint": "默认 http://127.0.0.1:6099",
+    "default": "http://127.0.0.1:6099"
+  },
+  "napcat_token": {
+    "description": "NapCat WebUI Token",
+    "type": "string",
+    "hint": "用于 /api/auth/login 鉴权",
+    "default": ""
+  },
+  "qq_account": {
+    "description": "目标 QQ 号",
+    "type": "string",
+    "hint": "用于账号密码登录",
+    "default": ""
+  },
+  "qq_password": {
+    "description": "目标 QQ 密码",
+    "type": "string",
+    "hint": "明文配置，提交时转 md5",
+    "default": ""
+  },
+  "enable_auto_login": {
+    "description": "是否启用自动重登",
+    "type": "bool",
+    "default": true
+  },
+  "check_interval_seconds": {
+    "description": "状态轮询间隔（秒）",
+    "type": "int",
+    "default": 20,
+    "minimum": 5
+  },
+  "request_timeout_seconds": {
+    "description": "HTTP 请求超时（秒）",
+    "type": "int",
+    "default": 10,
+    "minimum": 3
+  },
+  "qr_refresh_interval_seconds": {
+    "description": "二维码刷新间隔（秒）",
+    "type": "int",
+    "default": 120,
+    "minimum": 30
+  },
+  "umo_ids_for_qr": {
+    "description": "二维码通知目标 UMO 列表，支持逗号/换行分隔",
+    "type": "string",
+    "default": ""
+  },
+  "cache_dir": {
+    "description": "插件缓存目录（二维码图片）",
+    "type": "string",
+    "default": ""
+  },
+  "debug": {
+    "description": "是否输出调试日志",
+    "type": "bool",
+    "default": false
+  }
 }
