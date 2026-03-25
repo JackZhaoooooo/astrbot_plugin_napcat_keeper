@@ -16,6 +16,7 @@ from typing import Any, ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
+import qrcode
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -27,9 +28,12 @@ DEFAULT_CHECK_INTERVAL = 30
 DEFAULT_REQUEST_TIMEOUT = 10
 DEFAULT_WEBUI_CONFIG_PATH = "/root/AstrBot/napcat/config/webui.json"
 DEFAULT_NOTIFY_RETRY_COOLDOWN_SECONDS = 30
+DEFAULT_QR_NOTIFY_RETRY_COOLDOWN_SECONDS = 120
+DEFAULT_QR_IMAGE_DIR = "/tmp/astrbot_plugin_napcat_keeper_qr"
 MIN_CHECK_INTERVAL = 5
 MIN_REQUEST_TIMEOUT = 3
 MIN_NOTIFY_RETRY_COOLDOWN_SECONDS = 5
+MIN_QR_NOTIFY_RETRY_COOLDOWN_SECONDS = 10
 
 STATE_TEXT = {
     "logged_in": "🟢 已登录",
@@ -84,6 +88,21 @@ class NapcatKeeperPlugin(Star):
             minimum=MIN_NOTIFY_RETRY_COOLDOWN_SECONDS,
         )
         self.notify_umos = self._normalize_umo_list(config.get("notify_umos", []))
+        self.qr_notify_umos = self._normalize_umo_list(config.get("qr_notify_umos", []))
+        self.auto_send_qr_on_logged_out = self._parse_bool(
+            config.get("auto_send_qr_on_logged_out", True)
+        )
+        self.qr_notify_retry_cooldown_seconds = self._parse_int(
+            config.get(
+                "qr_notify_retry_cooldown_seconds",
+                DEFAULT_QR_NOTIFY_RETRY_COOLDOWN_SECONDS,
+            ),
+            default=DEFAULT_QR_NOTIFY_RETRY_COOLDOWN_SECONDS,
+            minimum=MIN_QR_NOTIFY_RETRY_COOLDOWN_SECONDS,
+        )
+        self.qr_image_dir = str(
+            config.get("qr_image_dir", DEFAULT_QR_IMAGE_DIR)
+        ).strip() or DEFAULT_QR_IMAGE_DIR
         self.debug = self._parse_bool(config.get("debug", False))
         self._resolved_napcat_token = self._resolve_napcat_token()
 
@@ -93,6 +112,9 @@ class NapcatKeeperPlugin(Star):
         self._check_lock = asyncio.Lock()
         self._webui_credential: str | None = None
         self._last_notify_attempt_at = 0.0
+        self._last_qr_notify_attempt_at = 0.0
+        self._last_qr_url: str | None = None
+        self._last_qr_image_path: str | None = None
         self._instance_label = hex(id(self))
 
     async def initialize(self):
@@ -118,6 +140,7 @@ class NapcatKeeperPlugin(Star):
             f" | 监控地址: {self.napcat_url}"
             f" | 检查间隔: {self.check_interval} 秒"
             f" | 通知目标: {len(self.notify_umos)}"
+            f" | 二维码通知目标: {len(self._get_qr_notify_targets())}"
             f" | WebUI Token: {'已就绪' if self._resolved_napcat_token else '未配置'}"
             f" | 实例: {self._instance_label}"
         )
@@ -174,6 +197,7 @@ class NapcatKeeperPlugin(Star):
 
         if previous and previous.state != "logged_in" and state.state == "logged_in":
             self._last_notify_attempt_at = 0.0
+            self._last_qr_notify_attempt_at = 0.0
             self._log(
                 f"NapCat 登录状态已恢复 | 账号: {self._format_account(state)}",
                 level="INFO",
@@ -182,6 +206,14 @@ class NapcatKeeperPlugin(Star):
         if self._should_attempt_logout_notification(previous, state):
             self._last_notify_attempt_at = time.monotonic()
             await self._send_logout_notifications(state)
+
+        if self._should_attempt_qr_notification(previous, state):
+            self._last_qr_notify_attempt_at = time.monotonic()
+            await self._send_qr_notifications_for_state(
+                state,
+                trigger="自动检测",
+                force_refresh=False,
+            )
 
     def _should_attempt_logout_notification(
         self,
@@ -200,6 +232,25 @@ class NapcatKeeperPlugin(Star):
         # 离线期间持续按间隔提醒（无论上次发送成功或失败）
         elapsed = time.monotonic() - self._last_notify_attempt_at
         return elapsed >= float(self.notify_retry_cooldown_seconds)
+
+    def _should_attempt_qr_notification(
+        self,
+        previous: LoginState | None,
+        current: LoginState,
+    ) -> bool:
+        if not self.auto_send_qr_on_logged_out:
+            return False
+        if not self._is_logout_like_state(current):
+            return False
+
+        if previous and previous.state == "logged_in":
+            return True
+
+        if previous is None:
+            return self.notify_on_initial_logged_out
+
+        elapsed = time.monotonic() - self._last_qr_notify_attempt_at
+        return elapsed >= float(self.qr_notify_retry_cooldown_seconds)
 
     @staticmethod
     def _is_logout_like_state(state: LoginState) -> bool:
@@ -330,6 +381,223 @@ class NapcatKeeperPlugin(Star):
             ),
             None,
         )
+
+    async def _fetch_qr_login_url(
+        self,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[str | None, str | None]:
+        status_endpoint = f"{self.napcat_url}/api/QQLogin/CheckLoginStatus"
+        errors: list[str] = []
+
+        for attempt in range(2):
+            credential, auth_error = await self._request_webui_credential(
+                force_refresh=(force_refresh or attempt > 0),
+            )
+            if not credential:
+                return None, f"WebUI 鉴权失败: {auth_error}"
+
+            payload, request_error = await self._post_json(
+                status_endpoint,
+                {},
+                headers=self._build_webui_headers(credential),
+            )
+            if payload is None:
+                return None, f"{status_endpoint}: {request_error}"
+
+            auth_failure = self._payload_indicates_auth_failure(payload)
+            if auth_failure:
+                errors.append(auth_failure)
+                self._webui_credential = None
+                continue
+
+            code = payload.get("code")
+            if code not in (0, "0", None):
+                message = self._extract_message(payload) or "unknown"
+                return None, (
+                    f"{status_endpoint}: code={code}, message={message}"
+                )
+
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                return None, f"{status_endpoint}: 返回结构异常"
+
+            is_login = data.get("isLogin")
+            qr_url = self._extract_qr_url(data)
+            if qr_url:
+                return qr_url, None
+
+            if is_login is True:
+                return None, "当前 NapCat 已登录，无需二维码。"
+
+            login_error = self._normalize_text(data.get("loginError"))
+            if login_error:
+                return None, f"NapCat 未返回可用二维码链接: {login_error}"
+
+            return None, "NapCat 未返回可用二维码链接。"
+
+        if errors:
+            return None, "；".join(errors)
+        return None, "未获取到二维码链接"
+
+    @classmethod
+    def _extract_qr_url(cls, payload: dict[str, Any]) -> str | None:
+        key_candidates = [
+            "qrcodeurl",
+            "qrcodeUrl",
+            "qrCodeUrl",
+            "qr_url",
+            "qrUrl",
+            "url",
+        ]
+        for key in key_candidates:
+            value = cls._normalize_text(payload.get(key))
+            if value:
+                return value
+
+        nested_candidates = [
+            payload.get("qrcode"),
+            payload.get("qrCode"),
+            payload.get("qr"),
+        ]
+        for nested in nested_candidates:
+            if not isinstance(nested, dict):
+                continue
+            for key in ("url", "link", "qrcodeurl", "qrcodeUrl"):
+                value = cls._normalize_text(nested.get(key))
+                if value:
+                    return value
+        return None
+
+    async def _send_qr_notifications_for_state(
+        self,
+        state: LoginState,
+        *,
+        trigger: str,
+        force_refresh: bool,
+    ) -> bool:
+        qr_url, qr_error = await self._fetch_qr_login_url(force_refresh=force_refresh)
+        if not qr_url:
+            self._log(
+                f"{trigger}二维码获取失败: {qr_error}",
+                level="WARNING",
+            )
+            return False
+
+        sent_count, total = await self._send_qr_notifications(
+            qr_url,
+            reason=state.detail,
+            trigger=trigger,
+        )
+        if total == 0:
+            return False
+        return sent_count > 0
+
+    async def _send_qr_notifications(
+        self,
+        qr_url: str,
+        *,
+        reason: str,
+        trigger: str,
+    ) -> tuple[int, int]:
+        targets = self._get_qr_notify_targets()
+        if not targets:
+            self._log("二维码通知已跳过：未配置二维码通知 UMO。", level="WARNING")
+            return 0, 0
+
+        image_path, image_error = self._generate_qr_image(qr_url)
+        if image_error:
+            self._log(
+                f"二维码图片生成失败，将仅发送二维码链接文本 | 错误: {image_error}",
+                level="WARNING",
+            )
+
+        message = self._build_qr_message(qr_url, reason=reason, trigger=trigger)
+        success_count = 0
+
+        for umo in targets:
+            can_send, precheck_info = self._precheck_umo_deliverability(umo)
+            if not can_send:
+                self._log(
+                    f"二维码通知发送未确认成功 | UMO: {umo} | 原因: {precheck_info}",
+                    level="WARNING",
+                )
+                continue
+            if precheck_info:
+                self._log(
+                    f"二维码通知发送前处理 | UMO: {umo} | 信息: {precheck_info}",
+                    level="INFO",
+                )
+
+            chain = MessageChain().message(message)
+            if image_path:
+                chain = chain.file_image(image_path)
+            try:
+                delivered = await self.context.send_message(umo, chain)
+            except Exception as exc:
+                self._log(
+                    f"二维码通知发送异常 | UMO: {umo} | 错误: {exc}",
+                    level="ERROR",
+                    exc_info=True,
+                )
+                continue
+
+            if delivered:
+                success_count += 1
+                self._log(
+                    f"二维码通知发送成功 | UMO: {umo}",
+                    level="INFO",
+                )
+            else:
+                self._log(
+                    f"二维码通知发送失败 | UMO: {umo} | 原因: 未找到匹配平台",
+                    level="WARNING",
+                )
+
+        self._last_qr_url = qr_url
+        self._last_qr_image_path = image_path
+
+        if success_count == 0:
+            self._log("二维码通知未通过任何 UMO 发送成功。", level="WARNING")
+        else:
+            self._log(
+                f"二维码通知完成 | 成功: {success_count}/{len(targets)}",
+                level="INFO",
+            )
+
+        return success_count, len(targets)
+
+    def _get_qr_notify_targets(self) -> list[str]:
+        return self.qr_notify_umos or self.notify_umos
+
+    def _build_qr_message(self, qr_url: str, *, reason: str, trigger: str) -> str:
+        return (
+            "NapCat 扫码登录二维码\n"
+            f"时间: {self._now_text()}\n"
+            f"触发: {trigger}\n"
+            "说明: 请在 2 分钟内扫码登录，过期可发送 /qr 刷新\n"
+            f"原因: {reason}\n"
+            f"二维码链接: {qr_url}"
+        )
+
+    def _generate_qr_image(self, qr_url: str) -> tuple[str | None, str | None]:
+        output_dir = Path(self.qr_image_dir)
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            return None, f"创建目录失败: {output_dir} ({exc})"
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fingerprint = hashlib.sha1(qr_url.encode("utf-8")).hexdigest()[:10]
+        image_path = output_dir / f"napcat_qr_{timestamp}_{fingerprint}.png"
+
+        try:
+            image = qrcode.make(qr_url)
+            image.save(image_path)
+        except Exception as exc:
+            return None, f"保存二维码图片失败: {exc}"
+
+        return str(image_path), None
 
     async def _fetch_login_state_via_onebot(
         self,
@@ -493,7 +761,14 @@ class NapcatKeeperPlugin(Star):
             detail=detail,
         )
 
-    async def _request_webui_credential(self) -> tuple[str | None, str | None]:
+    async def _request_webui_credential(
+        self,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[str | None, str | None]:
+        if force_refresh:
+            self._webui_credential = None
+
         if self._webui_credential:
             return self._webui_credential, None
 
@@ -889,3 +1164,26 @@ class NapcatKeeperPlugin(Star):
     async def napcat_status(self, event: AstrMessageEvent):
         state = await self.check_once()
         return event.plain_result(self._format_state_message(state))
+
+    @filter.command("qr")
+    async def refresh_qr(self, event: AstrMessageEvent):
+        qr_url, qr_error = await self._fetch_qr_login_url(force_refresh=True)
+        if not qr_url:
+            return event.plain_result(f"二维码刷新失败: {qr_error}")
+
+        sent_count, total = await self._send_qr_notifications(
+            qr_url,
+            reason="手动执行 /qr 刷新二维码",
+            trigger="手动指令",
+        )
+
+        if total == 0:
+            return event.plain_result(
+                "二维码已刷新，但未配置二维码通知 UMO，无法推送。\n"
+                f"二维码链接: {qr_url}"
+            )
+        return event.plain_result(
+            "二维码已刷新并推送。\n"
+            f"推送成功: {sent_count}/{total}\n"
+            f"二维码链接: {qr_url}"
+        )

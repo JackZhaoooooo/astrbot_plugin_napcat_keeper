@@ -1,9 +1,11 @@
 import importlib
 import sys
+import tempfile
 import time
 import types
 import unittest
-from unittest.mock import AsyncMock
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 
 class DummyLogger:
@@ -46,6 +48,11 @@ class DummyPlain:
         self.text = text
 
 
+class DummyFileImage:
+    def __init__(self, path):
+        self.path = path
+
+
 class DummyMessageChain:
     def __init__(self):
         self.chain = []
@@ -54,8 +61,15 @@ class DummyMessageChain:
         self.chain.append(DummyPlain(message))
         return self
 
+    def file_image(self, path):
+        self.chain.append(DummyFileImage(path))
+        return self
+
     def get_plain_text(self):
-        return " ".join(item.text for item in self.chain)
+        return " ".join(item.text for item in self.chain if hasattr(item, "text"))
+
+    def get_file_images(self):
+        return [item.path for item in self.chain if isinstance(item, DummyFileImage)]
 
 
 def install_astrbot_stubs():
@@ -96,7 +110,9 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
     def make_plugin(self, config=None, context=None):
         if context is None:
             context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))
-        return self.module.NapcatKeeperPlugin(context, dict(config or {}))
+        merged = {"auto_send_qr_on_logged_out": False}
+        merged.update(dict(config or {}))
+        return self.module.NapcatKeeperPlugin(context, merged)
 
     def make_state(self, state, user_id=None, nickname=None, detail="detail"):
         return self.module.LoginState(
@@ -393,6 +409,78 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         plugin._last_notify_attempt_at = time.monotonic() - 6
         await plugin.check_once()
         self.assertEqual(context.send_message.await_count, 2)
+
+    async def test_fetch_qr_login_url_from_check_login_status(self):
+        plugin = self.make_plugin()
+        plugin._request_webui_credential = AsyncMock(return_value=("cred", None))
+        plugin._post_json = AsyncMock(
+            return_value=(
+                {
+                    "code": 0,
+                    "message": "success",
+                    "data": {
+                        "isLogin": False,
+                        "qrcodeurl": "https://txz.qq.com/p?k=abc123&f=1600001615",
+                    },
+                },
+                None,
+            )
+        )
+
+        qr_url, error = await plugin._fetch_qr_login_url()
+
+        self.assertIsNone(error)
+        self.assertEqual(qr_url, "https://txz.qq.com/p?k=abc123&f=1600001615")
+
+    def test_generate_qr_image_creates_png_file(self):
+        plugin = self.make_plugin()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin.qr_image_dir = tmpdir
+            image_path, error = plugin._generate_qr_image("https://example.com/login-qr")
+
+            self.assertIsNone(error)
+            self.assertIsNotNone(image_path)
+            self.assertTrue(Path(image_path).exists())
+            self.assertTrue(image_path.endswith(".png"))
+
+    async def test_refresh_qr_command_pushes_qr_to_notify_umo(self):
+        context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))
+        plugin = self.make_plugin({"notify_umos": ["umo-1"]}, context=context)
+        plugin._fetch_qr_login_url = AsyncMock(
+            return_value=("https://txz.qq.com/p?k=latest&f=1600001615", None)
+        )
+        plugin._generate_qr_image = Mock(return_value=("/tmp/napcat_qr_test.png", None))
+
+        result = await plugin.refresh_qr(DummyEvent())
+
+        self.assertIn("推送成功: 1/1", result)
+        self.assertEqual(context.send_message.await_count, 1)
+        sent_chain = context.send_message.await_args.args[1]
+        self.assertIn("/tmp/napcat_qr_test.png", sent_chain.get_file_images())
+
+    async def test_auto_qr_notification_on_logout_transition(self):
+        context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))
+        plugin = self.make_plugin(
+            {
+                "notify_umos": ["umo-1"],
+                "auto_send_qr_on_logged_out": True,
+            },
+            context=context,
+        )
+        plugin._fetch_login_state = AsyncMock(
+            side_effect=[
+                self.make_state("logged_in", user_id="123456"),
+                self.make_state("logged_out", detail="账号退出"),
+            ]
+        )
+        plugin._send_qr_notifications_for_state = AsyncMock(return_value=True)
+
+        await plugin.check_once()
+        await plugin.check_once()
+
+        self.assertEqual(plugin._send_qr_notifications_for_state.await_count, 1)
+        call = plugin._send_qr_notifications_for_state.await_args
+        self.assertEqual(call.kwargs["trigger"], "自动检测")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 name: astrbot_plugin_napcat_keeper
 display_name: napcat登录监控
-version: 2.0.2
+version: 2.1.0
 author: JackZhaoooooo
-description: 监控 NapCat QQ 登录状态，并在退出登录时向 UMO 列表发送通知
+description: 监控 NapCat QQ 登录状态，支持退出通知与二维码登录推送
 repo: https://github.com/JackZhaoooooo/astrbot_plugin_napcat_keeper
 support_platforms:
   - aiocqhttp

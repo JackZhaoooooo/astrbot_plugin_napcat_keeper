@@ -50,6 +50,33 @@
         },
         "default": []
     },
+    "qr_notify_umos": {
+        "description": "二维码通知 UMO 列表",
+        "type": "list",
+        "hint": "可选；留空时复用 notify_umos。检测到未登录或执行 /qr 时推送二维码图片",
+        "items": {
+            "type": "string"
+        },
+        "default": []
+    },
+    "auto_send_qr_on_logged_out": {
+        "description": "检测到未登录时自动推送二维码",
+        "type": "bool",
+        "hint": "开启后会在未登录时按间隔向二维码通知 UMO 推送二维码",
+        "default": true
+    },
+    "qr_notify_retry_cooldown_seconds": {
+        "description": "二维码重复提醒间隔（秒）",
+        "type": "int",
+        "hint": "持续未登录时，按该间隔刷新并再次推送二维码；最小 10 秒，默认 120 秒",
+        "default": 120
+    },
+    "qr_image_dir": {
+        "description": "二维码图片缓存目录",
+        "type": "string",
+        "hint": "默认: /tmp/astrbot_plugin_napcat_keeper_qr",
+        "default": "/tmp/astrbot_plugin_napcat_keeper_qr"
+    },
     "debug": {
         "description": "输出全部轮询日志",
         "type": "bool",
