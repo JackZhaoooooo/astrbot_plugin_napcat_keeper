@@ -106,6 +106,19 @@ class NapcatKeeperTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertEqual(plugin._deep_find_qr_url(payload), "https://txz.qq.com/p?k=abc")
 
+    def test_extract_webui_credential_from_nested_payload(self):
+        plugin = self.make_plugin()
+        payload = {
+            "code": 0,
+            "message": "ok",
+            "data": {
+                "tokenInfo": {
+                    "Credential": "credential-abc",
+                }
+            },
+        }
+        self.assertEqual(plugin._extract_webui_credential(payload), "credential-abc")
+
     async def test_attempt_relogin_switches_to_qr_when_password_requires_verify(self):
         plugin = self.make_plugin(
             {
@@ -142,6 +155,21 @@ class NapcatKeeperTests(unittest.IsolatedAsyncioTestCase):
         await plugin._attempt_relogin(snapshot)
 
         self.assertEqual(plugin._enter_qr_login_flow.await_count, 1)
+
+    async def test_check_login_via_onebot_fallback_tries_multiple_paths(self):
+        plugin = self.make_plugin()
+        plugin._get_json = AsyncMock(
+            side_effect=[
+                (None, "HTTP 404 非 JSON"),
+                ({"data": {"user_id": 123456, "nickname": "bot"}}, None),
+            ]
+        )
+        plugin._post_json = AsyncMock()
+
+        snapshot = await plugin._check_login_via_onebot()
+
+        self.assertEqual(snapshot.login_state, "logged_in")
+        self.assertEqual(snapshot.account, "123456")
 
 
 if __name__ == "__main__":

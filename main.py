@@ -194,22 +194,44 @@ class NapcatKeeperPlugin(Star):
         )
 
     async def _check_login_via_onebot(self) -> LoginSnapshot:
-        endpoint = f"{self.napcat_url}/get_login_info"
-        payload, err = await self._get_json(endpoint)
-        if payload is None:
-            return LoginSnapshot(True, "error", err or "请求失败")
+        candidates = [
+            ("GET", f"{self.napcat_url}/get_login_info"),
+            ("GET", f"{self.napcat_url}/api/get_login_info"),
+            ("POST", f"{self.napcat_url}/get_login_info"),
+            ("POST", f"{self.napcat_url}/api/get_login_info"),
+        ]
 
-        account, nickname = self._extract_identity(payload)
-        if account:
+        last_error = ""
+        for method, endpoint in candidates:
+            if method == "GET":
+                payload, err = await self._get_json(endpoint)
+            else:
+                payload, err = await self._post_json(endpoint, {})
+
+            if payload is None:
+                last_error = f"{method} {endpoint} -> {err}"
+                continue
+
+            account, nickname = self._extract_identity(payload)
+            if account:
+                return LoginSnapshot(
+                    service_online=True,
+                    login_state="logged_in",
+                    detail=(
+                        f"{method} {endpoint} 检测到 QQ 已登录: "
+                        f"{self._format_identity(account, nickname)}"
+                    ),
+                    account=account,
+                    nickname=nickname,
+                )
+
             return LoginSnapshot(
-                service_online=True,
-                login_state="logged_in",
-                detail=f"get_login_info 检测到 QQ 已登录: {self._format_identity(account, nickname)}",
-                account=account,
-                nickname=nickname,
+                True,
+                "not_logged_in",
+                f"{method} {endpoint} 已响应，但未返回有效账号信息。",
             )
 
-        return LoginSnapshot(True, "not_logged_in", "get_login_info 未返回有效账号信息。")
+        return LoginSnapshot(True, "error", last_error or "请求失败")
 
     async def _attempt_relogin(self, snapshot: LoginSnapshot):
         if self.qq_account and self.qq_password and self.napcat_token:
@@ -328,17 +350,36 @@ class NapcatKeeperPlugin(Star):
         if resp is None:
             return None, err
 
-        data = resp.get("data") if isinstance(resp, dict) else None
-        if not isinstance(data, dict):
-            return None, "鉴权响应格式异常"
+        credential = self._extract_webui_credential(resp)
+        if credential:
+            self._webui_credential = credential
+            return credential, None
 
-        credential = str(data.get("Credential") or data.get("credential") or "").strip()
-        if not credential:
-            message = str(resp.get("message") or "") if isinstance(resp, dict) else ""
-            return None, message or "未返回 Credential"
+        message = ""
+        if isinstance(resp, dict):
+            message = str(resp.get("message") or resp.get("msg") or "").strip()
+            code = resp.get("code")
+            if code is not None:
+                message = f"code={code}, message={message or 'empty'}"
 
-        self._webui_credential = credential
-        return credential, None
+        return None, message or "鉴权响应格式异常（未解析到 Credential）"
+
+    def _extract_webui_credential(self, payload: Any) -> str | None:
+        if isinstance(payload, dict):
+            for key in ["Credential", "credential", "token", "access_token"]:
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            for value in payload.values():
+                found = self._extract_webui_credential(value)
+                if found:
+                    return found
+        elif isinstance(payload, list):
+            for item in payload:
+                found = self._extract_webui_credential(item)
+                if found:
+                    return found
+        return None
 
     async def _fetch_qr_url(self, credential: str) -> tuple[str | None, str]:
         candidates = [
