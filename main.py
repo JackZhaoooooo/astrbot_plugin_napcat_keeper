@@ -128,7 +128,6 @@ class NapcatKeeperPlugin(Star):
         self.debug_mode = self._parse_bool(config.get("debug", False), default=False)
 
         self.qq_account = config.get("qq_account", "")
-        self.qq_password = config.get("qq_password", "")
         self.logout_notify_umos = self._normalize_umo_list(
             config.get("logout_notify_umos", [])
         )
@@ -169,10 +168,6 @@ class NapcatKeeperPlugin(Star):
         self._log(f"自动登录恢复: {'启用' if self.enable_auto_login else '禁用'}")
         self._log(f"调试日志: {'启用' if self.debug_mode else '禁用'}")
         self._log(f"展示账号: {'已配置' if self.qq_account else '未配置'}")
-        self._log(
-            "密码登录: "
-            f"{'已配置' if self.qq_password else '未配置（必要时将改用二维码登录）'}"
-        )
         logout_notify_text = (
             f"退出登录通知: {len(self.logout_notify_umos)} 个 UMO"
             if self.logout_notify_umos
@@ -242,10 +237,6 @@ class NapcatKeeperPlugin(Star):
     @staticmethod
     def _hash_webui_token(token: str) -> str:
         return hashlib.sha256(f"{token}.napcat".encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _password_md5(password: str) -> str:
-        return hashlib.md5(password.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _normalize_user_id(raw_user_id: Any) -> str | None:
@@ -492,21 +483,6 @@ class NapcatKeeperPlugin(Star):
                 *self.relogin_notify_umos,
             ]
         )
-
-    @staticmethod
-    def _password_login_requires_qr(detail: str | None) -> bool:
-        lowered = str(detail or "").lower()
-        keywords = [
-            "需要验证码",
-            "验证码",
-            "新设备验证",
-            "设备验证",
-            "扫码登录",
-            "二维码登录",
-            "captcha",
-            "new device",
-        ]
-        return any(keyword in lowered for keyword in keywords)
 
     def _get_reusable_manual_login_context(self, *, account: str) -> dict[str, Any]:
         if not self._is_manual_login_pending():
@@ -1848,152 +1824,6 @@ class NapcatKeeperPlugin(Star):
             ),
         )
 
-    async def _quick_login_by_account(
-        self,
-        session: aiohttp.ClientSession,
-        credential: str,
-        account: str,
-    ) -> tuple[bool, str]:
-        (
-            config_endpoint,
-            config_code,
-            config_payload,
-            config_raw_text,
-        ) = await self._call_webui_api(
-            session,
-            "/QQLogin/SetQuickLoginQQ",
-            credential=credential,
-            payload={"uin": account},
-        )
-        if config_payload is None:
-            response_text = config_raw_text or f"HTTP {config_code}"
-            return (
-                False,
-                "写入快速登录账号失败。"
-                f" | 接口: {config_endpoint} | 响应: {response_text}",
-            )
-
-        if not self._is_webui_success(config_payload):
-            return (
-                False,
-                f"{self._build_webui_error_detail('写入快速登录账号失败', config_payload, config_raw_text)}"
-                f" | 接口: {config_endpoint} | HTTP {config_code}",
-            )
-
-        (
-            login_endpoint,
-            login_code,
-            login_payload,
-            login_raw_text,
-        ) = await self._call_webui_api(
-            session,
-            "/QQLogin/SetQuickLogin",
-            credential=credential,
-            payload={"uin": account},
-        )
-        if login_payload is None:
-            response_text = login_raw_text or f"HTTP {login_code}"
-            return (
-                False,
-                "触发快速登录失败，接口返回了非 JSON 响应。"
-                f" | 接口: {login_endpoint} | 响应: {response_text}",
-            )
-
-        login_message = self._extract_webui_message(login_payload)
-        if not self._is_webui_success(login_payload):
-            if self._looks_like_duplicate_login_conflict(login_message):
-                return (
-                    False,
-                    "快速登录未成功，当前 QQ 账号已在其他位置登录，"
-                    "NapCat 端尚未完成登录。"
-                    f" | 原始响应: {login_message} | 接口: {login_endpoint}",
-                )
-            if self._looks_like_already_logged_in(login_message):
-                return (
-                    True,
-                    f"QQ {account} 当前已经处于登录状态，无需重复执行快速登录。"
-                    f" | 接口: {login_endpoint}",
-                )
-            return (
-                False,
-                f"{self._build_webui_error_detail('触发快速登录失败', login_payload, login_raw_text)}"
-                f" | 接口: {login_endpoint} | HTTP {login_code}",
-            )
-
-        return (
-            True,
-            f"已为 QQ {account} 提交快速登录请求。 | 接口: {login_endpoint}",
-        )
-
-    async def _password_login_by_account(
-        self,
-        session: aiohttp.ClientSession,
-        credential: str,
-        account: str,
-        password: str,
-    ) -> tuple[bool, str]:
-        (
-            endpoint,
-            status_code,
-            payload,
-            raw_text,
-        ) = await self._call_webui_api(
-            session,
-            "/QQLogin/PasswordLogin",
-            credential=credential,
-            payload={
-                "uin": account,
-                "passwordMd5": self._password_md5(password),
-            },
-        )
-
-        if payload is None:
-            response_text = raw_text or f"HTTP {status_code}"
-            return (
-                False,
-                "QQ 密码登录接口返回了非 JSON 响应。"
-                f" | 接口: {endpoint} | 响应: {response_text}",
-            )
-
-        message = self._extract_webui_message(payload)
-        if not self._is_webui_success(payload):
-            if self._looks_like_duplicate_login_conflict(message):
-                return (
-                    False,
-                    "QQ 密码登录未成功，当前 QQ 账号已在其他位置登录，"
-                    "NapCat 端尚未完成登录。"
-                    f" | 原始响应: {message} | 接口: {endpoint}",
-                )
-            if self._looks_like_already_logged_in(message):
-                return (
-                    True,
-                    f"QQ {account} 当前已经处于登录状态，无需重复执行密码登录。"
-                    f" | 接口: {endpoint}",
-                )
-            return (
-                False,
-                f"{self._build_webui_error_detail('QQ 密码登录失败', payload, raw_text)}"
-                f" | 接口: {endpoint} | HTTP {status_code}",
-            )
-
-        data = self._extract_webui_response_data(payload)
-        if isinstance(data, dict) and data.get("needCaptcha"):
-            return (
-                False,
-                "QQ 密码登录触发验证码校验，无法直接完成普通登录，需要切换为二维码登录。",
-            )
-
-        if isinstance(data, dict) and data.get("needNewDevice"):
-            return (
-                False,
-                "QQ 密码登录触发新设备验证，无法直接完成普通登录，需要切换为二维码登录。",
-            )
-
-        return (
-            True,
-            f"已为 QQ {account} 提交密码登录请求。 | 接口: {endpoint}",
-        )
-
     async def _auto_login_qq(
         self,
         *,
@@ -2001,16 +1831,20 @@ class NapcatKeeperPlugin(Star):
         notify_manual_action: bool = True,
     ) -> AutoLoginAttemptResult:
         account = str(self.qq_account or "").strip()
-        password = str(self.qq_password or "").strip()
         if reset_manual_pending:
             self._clear_manual_login_pending()
         if not self.enable_auto_login:
             result = AutoLoginAttemptResult(
                 submitted=False,
-                detail="已禁用 QQ 自动登录恢复，跳过登录恢复流程。",
+                detail="已禁用 QQ 二维码登录恢复，跳过二维码登录流程。",
             )
             self._log(result.detail, result.level)
             return result
+
+        self._log(
+            "准备执行 QQ 二维码登录"
+            f" | 账号: {account or '未配置（扫码后以实际登录账号为准）'}"
+        )
 
         manual_action_required = False
         try:
@@ -2021,63 +1855,20 @@ class NapcatKeeperPlugin(Star):
                     self._log("NapCat WebUI 鉴权成功，已获取临时 Credential。")
                 else:
                     self._log(
-                        "未配置 napcat_token，将直接调用 NapCat WebUI 登录接口。",
+                        "未配置 napcat_token，将直接调用 NapCat WebUI 二维码接口。",
                         "WARNING",
                     )
-                if account and password:
-                    self._log(f"准备执行 QQ 普通登录 | 账号: {account} | 方式: 账号密码")
-                    success, detail = await self._password_login_by_account(
-                        session,
-                        credential,
-                        account,
-                        password,
-                    )
-                    if success:
-                        detail = (
-                            "QQ 普通登录已提交。"
-                            f" | 结果: {detail}"
-                        )
-                    elif self._password_login_requires_qr(detail):
-                        self._log(
-                            "QQ 普通登录无法直接完成，切换为二维码登录。"
-                            f" | 账号: {account} | 原因: {detail}",
-                            "WARNING",
-                        )
-                        detail = await self._prepare_manual_login_assistance(
-                            session,
-                            credential,
-                            account,
-                            "QQ 普通登录未能直接完成，已切换为二维码登录。"
-                            f" | 原因: {detail}",
-                            notify=notify_manual_action,
-                        )
-                        success = False
-                        manual_action_required = self._has_valid_manual_login_qrcode(
-                            self._manual_login_pending_context
-                        )
-                else:
-                    qr_reason = (
-                        "未配置 qq_password，无法执行账号密码登录，已直接切换为二维码登录。"
-                        if account
-                        else "未配置 qq_account 或 qq_password，无法执行账号密码登录，已直接切换为二维码登录。"
-                    )
-                    self._log(
-                        "准备执行 QQ 二维码登录"
-                        f" | 账号: {account or '未配置（扫码后以实际登录账号为准）'}"
-                        f" | 原因: {qr_reason}",
-                        "WARNING",
-                    )
-                    detail = await self._prepare_manual_login_assistance(
-                        session,
-                        credential,
-                        account,
-                        qr_reason,
-                        notify=notify_manual_action,
-                    )
-                    success = False
-                    manual_action_required = self._has_valid_manual_login_qrcode(
-                        self._manual_login_pending_context
-                    )
+                detail = await self._prepare_manual_login_assistance(
+                    session,
+                    credential,
+                    account,
+                    "NapCat 当前未登录，需要扫码完成 QQ 登录。",
+                    notify=notify_manual_action,
+                )
+                success = False
+                manual_action_required = self._has_valid_manual_login_qrcode(
+                    self._manual_login_pending_context
+                )
         except (ValueError, RuntimeError) as e:
             result = AutoLoginAttemptResult(
                 submitted=False,

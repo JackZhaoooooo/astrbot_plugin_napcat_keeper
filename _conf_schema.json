@@ -44,19 +44,13 @@
     "enable_auto_login": {
         "description": "掉线后自动重新登录",
         "type": "bool",
-        "hint": "开启后优先尝试账号密码登录，必要时自动切换为二维码登录",
+        "hint": "开启后生成 QQ 登录二维码，并在需要时自动刷新",
         "default": true
     },
     "qq_account": {
-        "description": "QQ 账号",
+        "description": "QQ 账号（可选）",
         "type": "string",
-        "hint": "填写机器人 QQ 号；用于账号密码登录和日志展示",
-        "default": ""
-    },
-    "qq_password": {
-        "description": "QQ 密码（可选）",
-        "type": "string",
-        "hint": "已配置时优先走账号密码登录；未配置时直接切换二维码登录",
+        "hint": "可选，仅用于日志和通知中展示预期账号",
         "default": ""
     },
     "logout_notify_umos": {

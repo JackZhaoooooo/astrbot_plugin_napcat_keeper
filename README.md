@@ -6,7 +6,7 @@
 
 - ✅ **自动检测** - 定时检查 NapCat 登录状态（使用 `get_login_info` API）
 - ✅ **自动恢复** - 掉线时自动重启 NapCat
-- ✅ **自动重登** - 优先尝试 QQ 账号密码登录，必要时自动切换为二维码登录
+- ✅ **自动重登** - 检测掉线后自动生成 QQ 登录二维码
 - ✅ **二维码续期** - 登录二维码默认有效 2 分钟，超时后自动刷新并继续通知
 - ✅ **登录态通知** - 支持通过 UMO 接收退出登录/重新登录通知
 - ✅ **调试开关** - 可按需输出全部巡检日志，避免平台日志被正常轮询刷屏
@@ -31,9 +31,8 @@
 | `check_interval` | `60` | 检查间隔（秒） |
 | `max_retries` | `3` | 连续失败次数阈值 |
 | `enable_auto_restart` | `true` | 是否启用自动恢复 |
-| `enable_auto_login` | `true` | 是否启用自动登录恢复（优先密码登录，必要时切二维码） |
-| `qq_account` | `""` | QQ 账号（用于密码登录和日志展示） |
-| `qq_password` | `""` | QQ 密码（可选；已配置时优先使用账号密码登录） |
+| `enable_auto_login` | `true` | 是否启用二维码登录恢复 |
+| `qq_account` | `""` | QQ 账号（可选，仅用于日志/通知展示） |
 | `logout_notify_umos` | `[]` | QQ 退出登录时主动通知的 UMO 列表 |
 | `relogin_notify_umos` | `[]` | QQ 重新登录时主动通知的 UMO 列表 |
 | `manual_login_notify_umos` | `[]` | QQ 登录需要扫码时主动通知的 UMO 列表；留空则默认复用登录态通知目标 |
@@ -69,7 +68,7 @@ git clone https://github.com/JackZhaoooooo/astrbot_plugin_napcat_keeper.git
 │  1. 终止进程    │
 │  2. 清理状态    │
 │  3. 重启 NapCat │
-│  4. 密码/二维码 │
+│  4. 二维码登录  │
 └─────────────────┘
 ```
 
@@ -77,7 +76,7 @@ git clone https://github.com/JackZhaoooooo/astrbot_plugin_napcat_keeper.git
 2. 每隔 `check_interval` 秒调用 `get_login_info` API 检查状态
 3. 连续失败达到 `max_retries` 次后触发自动恢复
 4. 如果 NapCat 服务仍在线，仅执行 QQ 重新登录流程，不再整套重启
-5. 如果检测到 QQ 未登录，插件会先尝试 QQ 账号密码登录；若当前场景必须扫码，自动切换为二维码登录并推送二维码
+5. 如果检测到 QQ 未登录，插件会直接生成 NapCat 登录二维码，并进入二维码登录等待模式
 6. 二维码默认有效 2 分钟；冷却期内插件不会重启 NapCat，而是持续轮询状态，并在二维码超时后自动生成新的二维码
 
 ## 注意事项
@@ -89,8 +88,8 @@ git clone https://github.com/JackZhaoooooo/astrbot_plugin_napcat_keeper.git
 - `qq_official` / `qq_official_webhook` 类型的 UMO 依赖最近一条有效 `msg_id`
 - 如果你要把它们用于登录态通知，建议优先使用最近和机器人有过交互的会话
 - 更稳定的做法是使用群聊 UMO，或其他支持主动发送的平台 UMO
-- 建议同时配置 `qq_account`、`qq_password` 和 `napcat_token`，这样插件能优先走密码登录，并在需要扫码时稳定获取二维码
-- 当前版本不会再输出验证码验证地址；当密码登录无法直接完成时，会明确记录“已切换为二维码登录”
+- 建议配置 `napcat_token`，这样插件可以更稳定地调用 NapCat WebUI 生成二维码
+- 当前版本只保留二维码登录恢复，不再输出验证码验证地址或走密码/快速登录分支
 
 ## 兼容性
 
