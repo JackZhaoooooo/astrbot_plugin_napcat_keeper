@@ -499,7 +499,11 @@ class NapcatKeeperPlugin(Star):
         except Exception as e:
             self._log(f"清理 WebUI Credential 缓存失败: {e}", "WARNING")
 
-    def _load_cached_webui_credential_from_disk(self) -> str | None:
+    def _load_cached_webui_credential_from_disk(
+        self,
+        *,
+        allow_stale: bool = False,
+    ) -> str | None:
         token = str(self.napcat_token or "").strip()
         if not token:
             return None
@@ -528,7 +532,13 @@ class NapcatKeeperPlugin(Star):
         except (TypeError, ValueError):
             return None
 
-        if cached_at <= 0 or time.time() - cached_at >= WEBUI_CREDENTIAL_CACHE_TTL_SECONDS:
+        if cached_at <= 0:
+            return None
+
+        if (
+            not allow_stale
+            and time.time() - cached_at >= WEBUI_CREDENTIAL_CACHE_TTL_SECONDS
+        ):
             return None
 
         if str(payload.get("napcat_root_url") or "").strip() != self._normalize_napcat_root_url():
@@ -1064,6 +1074,12 @@ class NapcatKeeperPlugin(Star):
             if disk_cached_credential:
                 return disk_cached_credential
 
+        stale_cached_credential = None
+        if not force_refresh and not cached_credential:
+            stale_cached_credential = self._load_cached_webui_credential_from_disk(
+                allow_stale=True
+            )
+
         endpoint = self._build_webui_api_url("/auth/login")
         created_session = session is None
         if created_session:
@@ -1082,12 +1098,14 @@ class NapcatKeeperPlugin(Star):
 
         if payload is None:
             response_text = raw_text or f"HTTP {status_code}"
-            if cached_credential and self._looks_like_rate_limited(response_text):
-                self._log(
-                    "NapCat WebUI 鉴权触发限流，继续复用已缓存 Credential。",
-                    "WARNING",
-                )
-                return cached_credential
+            if self._looks_like_rate_limited(response_text):
+                fallback_credential = cached_credential or stale_cached_credential
+                if fallback_credential:
+                    self._log(
+                        "NapCat WebUI 鉴权触发限流，继续复用已缓存 Credential。",
+                        "WARNING",
+                    )
+                    return fallback_credential
             raise RuntimeError(
                 "NapCat WebUI 鉴权接口返回了非 JSON 响应。"
                 f" | 接口: {endpoint} | 响应: {response_text}"
@@ -1099,12 +1117,14 @@ class NapcatKeeperPlugin(Star):
                 payload,
                 raw_text,
             )
-            if cached_credential and self._looks_like_rate_limited(rate_limit_detail):
-                self._log(
-                    "NapCat WebUI 鉴权触发限流，继续复用已缓存 Credential。",
-                    "WARNING",
-                )
-                return cached_credential
+            if self._looks_like_rate_limited(rate_limit_detail):
+                fallback_credential = cached_credential or stale_cached_credential
+                if fallback_credential:
+                    self._log(
+                        "NapCat WebUI 鉴权触发限流，继续复用已缓存 Credential。",
+                        "WARNING",
+                    )
+                    return fallback_credential
             raise RuntimeError(
                 f"{rate_limit_detail}"
                 f" | 接口: {endpoint} | HTTP {status_code}"

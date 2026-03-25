@@ -276,6 +276,45 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(credential, "disk-credential")
             self.assertEqual(plugin._post_json_request.await_count, 0)
 
+    async def test_request_webui_credential_reuses_stale_disk_cache_when_auth_rate_limited(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin = self.make_plugin(
+                {
+                    "napcat_token": "token123",
+                    "napcat_dir": tmpdir,
+                }
+            )
+            os.makedirs(os.path.join(tmpdir, "cache"), exist_ok=True)
+            with open(plugin._webui_credential_cache_path(), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "credential": "stale-disk-credential",
+                        "cached_at": self.module.time.time() - 3600,
+                        "napcat_root_url": plugin._normalize_napcat_root_url(),
+                        "token_hash": plugin._hash_text("token123"),
+                    },
+                    f,
+                    ensure_ascii=False,
+                )
+
+            plugin._post_json_request = AsyncMock(
+                return_value=(
+                    200,
+                    {
+                        "code": 1,
+                        "message": "login rate limit",
+                        "data": None,
+                    },
+                    None,
+                )
+            )
+            plugin._log = lambda *args, **kwargs: None
+
+            credential = await plugin._request_webui_credential(session=object())
+
+            self.assertEqual(credential, "stale-disk-credential")
+            self.assertEqual(plugin._post_json_request.await_count, 1)
+
     async def test_call_webui_api_retries_once_after_credential_expires(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             plugin = self.make_plugin(
