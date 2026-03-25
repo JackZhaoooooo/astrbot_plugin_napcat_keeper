@@ -36,9 +36,9 @@
         "default": true
     },
     "notify_retry_cooldown_seconds": {
-        "description": "离线通知失败重试间隔（秒）",
+        "description": "离线通知重复提醒间隔（秒）",
         "type": "int",
-        "hint": "通知发送失败时会按该间隔重试，最小 5 秒，默认 30 秒",
+        "hint": "只要持续离线，就会按该间隔重复发送提醒；最小 5 秒，默认 30 秒",
         "default": 30
     },
     "notify_umos": {

@@ -1,5 +1,6 @@
 import importlib
 import sys
+import time
 import types
 import unittest
 from unittest.mock import AsyncMock
@@ -367,6 +368,31 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(delivered)
         self.assertEqual(context.send_message.await_count, 1)
+
+    async def test_offline_reminds_again_when_interval_elapsed(self):
+        context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))
+        plugin = self.make_plugin(
+            {
+                "notify_umos": ["umo-1"],
+                "notify_retry_cooldown_seconds": 5,
+            },
+            context=context,
+        )
+        plugin._fetch_login_state = AsyncMock(
+            return_value=self.make_state("logged_out", detail="持续离线")
+        )
+        plugin._last_state = self.make_state("logged_out", detail="持续离线")
+
+        plugin._last_notify_attempt_at = time.monotonic() - 6
+        await plugin.check_once()
+        self.assertEqual(context.send_message.await_count, 1)
+
+        await plugin.check_once()
+        self.assertEqual(context.send_message.await_count, 1)
+
+        plugin._last_notify_attempt_at = time.monotonic() - 6
+        await plugin.check_once()
+        self.assertEqual(context.send_message.await_count, 2)
 
 
 if __name__ == "__main__":

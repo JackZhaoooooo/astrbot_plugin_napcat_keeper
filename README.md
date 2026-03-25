@@ -14,7 +14,7 @@
 - 如果 WebUI 鉴权或接口检测失败，会再回退到 onebot `get_login_info` 系列接口
 - 对 `Unauthorized`、`token is empty` 这类鉴权失败响应不再误判成“未登录”
 - 只有在状态从“已登录”切到“未登录”时才发送一次通知，避免轮询刷屏
-- 支持“启动时已离线通知一次”和“通知失败冷却重试”
+- 支持“启动时已离线通知一次”和“离线期间按间隔持续提醒”
 - 支持命令 `/napcat_status` 手动查看当前状态
 
 ## 配置项
@@ -27,7 +27,7 @@
 | `check_interval` | `30` | 轮询间隔，单位秒 |
 | `request_timeout_seconds` | `10` | 单次请求超时秒数 |
 | `notify_on_initial_logged_out` | `true` | 插件启动后首次检测到已离线时也发送一次通知 |
-| `notify_retry_cooldown_seconds` | `30` | 离线通知发送失败后的重试间隔（秒） |
+| `notify_retry_cooldown_seconds` | `30` | 持续离线时的重复提醒间隔（秒） |
 | `notify_umos` | `[]` | 退出登录通知目标 UMO 列表 |
 | `debug` | `false` | 开启后输出每次轮询日志 |
 

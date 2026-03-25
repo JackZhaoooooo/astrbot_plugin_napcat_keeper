@@ -92,7 +92,6 @@ class NapcatKeeperPlugin(Star):
         self._last_state: LoginState | None = None
         self._check_lock = asyncio.Lock()
         self._webui_credential: str | None = None
-        self._logout_notification_sent = False
         self._last_notify_attempt_at = 0.0
         self._instance_label = hex(id(self))
 
@@ -174,7 +173,7 @@ class NapcatKeeperPlugin(Star):
             self._log_state(state)
 
         if previous and previous.state != "logged_in" and state.state == "logged_in":
-            self._logout_notification_sent = False
+            self._last_notify_attempt_at = 0.0
             self._log(
                 f"NapCat 登录状态已恢复 | 账号: {self._format_account(state)}",
                 level="INFO",
@@ -182,9 +181,7 @@ class NapcatKeeperPlugin(Star):
 
         if self._should_attempt_logout_notification(previous, state):
             self._last_notify_attempt_at = time.monotonic()
-            delivered = await self._send_logout_notifications(state)
-            if delivered:
-                self._logout_notification_sent = True
+            await self._send_logout_notifications(state)
 
     def _should_attempt_logout_notification(
         self,
@@ -192,11 +189,6 @@ class NapcatKeeperPlugin(Star):
         current: LoginState,
     ) -> bool:
         if not self._is_logout_like_state(current):
-            if current.state == "logged_in":
-                self._logout_notification_sent = False
-            return False
-
-        if self._logout_notification_sent:
             return False
 
         if previous and previous.state == "logged_in":
@@ -205,7 +197,7 @@ class NapcatKeeperPlugin(Star):
         if previous is None:
             return self.notify_on_initial_logged_out
 
-        # 离线期间若首次通知发送失败，按冷却周期重试
+        # 离线期间持续按间隔提醒（无论上次发送成功或失败）
         elapsed = time.monotonic() - self._last_notify_attempt_at
         return elapsed >= float(self.notify_retry_cooldown_seconds)
 
