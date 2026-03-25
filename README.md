@@ -7,6 +7,7 @@
 - ✅ **自动检测** - 定时检查 NapCat 登录状态（使用 `get_login_info` API）
 - ✅ **自动恢复** - 掉线时自动重启 NapCat
 - ✅ **自动重登** - 支持配置 QQ 账号密码实现自动重新登录
+- ✅ **登录辅助** - 遇到验证码/新设备验证时自动切换为二维码辅助登录，避免反复重启
 - ✅ **登录态通知** - 支持通过 UMO 接收退出登录/重新登录通知
 - ✅ **调试开关** - 可按需输出全部巡检日志，避免平台日志被正常轮询刷屏
 - ✅ **手动控制** - 提供指令手动查看状态/恢复
@@ -35,6 +36,9 @@
 | `qq_password` | `""` | QQ 密码（用于自动登录） |
 | `logout_notify_umos` | `[]` | QQ 退出登录时主动通知的 UMO 列表 |
 | `relogin_notify_umos` | `[]` | QQ 重新登录时主动通知的 UMO 列表 |
+| `manual_login_notify_umos` | `[]` | QQ 登录需要人工验证/扫码时主动通知的 UMO 列表；留空则默认复用登录态通知目标 |
+| `auto_qr_login_fallback` | `true` | 当密码登录触发验证码、快速登录提示重新登录时，自动尝试获取 NapCat 二维码登录链接 |
+| `manual_login_cooldown_seconds` | `900` | 登录需要人工处理时的冷却时长；冷却期内只轮询状态，不重复重启 NapCat |
 | `debug` | `false` | 开启后输出全部巡检日志；关闭后隐藏正常在线的轮询日志，但保留恢复和重新登录过程日志 |
 
 ## 安装
@@ -73,7 +77,9 @@ git clone https://github.com/JackZhaoooooo/astrbot_plugin_napcat_keeper.git
 1. 插件启动后创建异步监控任务
 2. 每隔 `check_interval` 秒调用 `get_login_info` API 检查状态
 3. 连续失败达到 `max_retries` 次后触发自动恢复
-4. 恢复流程：终止进程 → 清理状态 → 重启 → 等待 → 验证
+4. 如果 NapCat 服务仍在线，仅执行 QQ 重新登录流程，不再整套重启
+5. 如果密码登录触发验证码/新设备验证，插件会尝试获取验证链接或二维码，并进入人工登录等待模式
+6. 冷却期内插件只轮询登录状态，不重复重启 NapCat，等待你完成扫码或验证
 
 ## 注意事项
 
@@ -84,6 +90,7 @@ git clone https://github.com/JackZhaoooooo/astrbot_plugin_napcat_keeper.git
 - `qq_official` / `qq_official_webhook` 类型的 UMO 依赖最近一条有效 `msg_id`
 - 如果你要把它们用于登录态通知，建议优先使用最近和机器人有过交互的会话
 - 更稳定的做法是使用群聊 UMO，或其他支持主动发送的平台 UMO
+- 遇到验证码、设备锁、新设备验证时，插件不会尝试绕过腾讯校验；它会改为输出验证链接或二维码，等待你手动完成
 
 ## 兼容性
 

@@ -1076,9 +1076,14 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
                 "QQ 密码登录需要验证码，当前无法自动完成后续步骤。 | 验证地址: https://example.com/captcha",
             )
         )
-        plugin._quick_login_by_account = AsyncMock(
-            return_value=(False, "快速登录当前不可用。")
+        plugin._prepare_manual_login_assistance = AsyncMock(
+            return_value=(
+                "QQ 密码登录需要验证码，当前无法自动完成后续步骤。"
+                " | 验证地址: https://example.com/captcha"
+                " | 可改用二维码登录 NapCat: https://example.com/qr"
+            )
         )
+        plugin._quick_login_by_account = AsyncMock()
         plugin._log = lambda *args, **kwargs: None
 
         result = await plugin._auto_login_qq()
@@ -1088,7 +1093,9 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.manual_action_required)
         self.assertIn("需要验证码", result.detail)
         self.assertIn("https://example.com/captcha", result.detail)
-        self.assertEqual(plugin._quick_login_by_account.await_count, 1)
+        self.assertIn("https://example.com/qr", result.detail)
+        self.assertEqual(plugin._prepare_manual_login_assistance.await_count, 1)
+        self.assertEqual(plugin._quick_login_by_account.await_count, 0)
 
     async def test_auto_login_qq_falls_back_to_quick_login_when_password_login_fails(self):
         plugin = self.make_plugin(
@@ -1102,12 +1109,13 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         plugin._password_login_by_account = AsyncMock(
             return_value=(
                 False,
-                "QQ 密码登录需要验证码，当前无法自动完成后续步骤。 | 验证地址: https://example.com/captcha",
+                "QQ 密码登录失败: 服务器繁忙，请稍后重试。",
             )
         )
         plugin._quick_login_by_account = AsyncMock(
             return_value=(True, "已为 QQ 123456789 提交快速登录请求。")
         )
+        plugin._prepare_manual_login_assistance = AsyncMock()
         plugin._log = lambda *args, **kwargs: None
 
         result = await plugin._auto_login_qq()
@@ -1119,6 +1127,37 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("快速登录结果", result.detail)
         self.assertEqual(plugin._password_login_by_account.await_count, 1)
         self.assertEqual(plugin._quick_login_by_account.await_count, 1)
+        self.assertEqual(plugin._prepare_manual_login_assistance.await_count, 0)
+
+    async def test_auto_login_qq_uses_qr_assistance_when_quick_login_requires_relogin(self):
+        plugin = self.make_plugin(
+            {
+                "enable_auto_login": True,
+                "qq_account": "123456789",
+                "qq_password": "",
+            }
+        )
+        plugin._request_webui_credential = AsyncMock(return_value="credential-123")
+        plugin._quick_login_by_account = AsyncMock(
+            return_value=(
+                False,
+                "触发快速登录失败: 登录态已失效，请重新登录。 | 接口: http://localhost:6099/api/QQLogin/SetQuickLogin | HTTP 200",
+            )
+        )
+        plugin._prepare_manual_login_assistance = AsyncMock(
+            return_value=(
+                "触发快速登录失败: 登录态已失效，请重新登录。"
+                " | 可改用二维码登录 NapCat: https://example.com/qr"
+            )
+        )
+        plugin._log = lambda *args, **kwargs: None
+
+        result = await plugin._auto_login_qq()
+
+        self.assertFalse(result.submitted)
+        self.assertTrue(result.manual_action_required)
+        self.assertIn("https://example.com/qr", result.detail)
+        self.assertEqual(plugin._prepare_manual_login_assistance.await_count, 1)
 
     async def test_wait_for_napcat_service_ready_returns_early_when_service_becomes_online(self):
         plugin = self.make_plugin()
@@ -1216,7 +1255,7 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("collect", order)
         self.assertLess(order.index("auto_login"), order.index("collect"))
 
-    async def test_recover_for_snapshot_always_uses_full_recovery_for_not_logged_in(self):
+    async def test_recover_for_snapshot_uses_login_only_recovery_when_service_is_online(self):
         plugin = self.make_plugin()
         snapshot = self.make_snapshot(
             "offline",
@@ -1224,11 +1263,13 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
             login_detail="WebUI 检测到当前未登录 QQ。",
         )
         plugin._recover_napcat = AsyncMock()
+        plugin._recover_login_only = AsyncMock()
         plugin._log = lambda *args, **kwargs: None
 
         await plugin._recover_for_snapshot(snapshot)
 
-        self.assertEqual(plugin._recover_napcat.await_count, 1)
+        self.assertEqual(plugin._recover_login_only.await_count, 1)
+        self.assertEqual(plugin._recover_napcat.await_count, 0)
 
     async def test_recover_for_snapshot_always_uses_full_recovery_when_service_is_abnormal(self):
         plugin = self.make_plugin()
@@ -1238,11 +1279,61 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
             service_detail="连接失败: connection refused",
         )
         plugin._recover_napcat = AsyncMock()
+        plugin._recover_login_only = AsyncMock()
         plugin._log = lambda *args, **kwargs: None
 
         await plugin._recover_for_snapshot(snapshot)
 
         self.assertEqual(plugin._recover_napcat.await_count, 1)
+        self.assertEqual(plugin._recover_login_only.await_count, 0)
+
+    async def test_recover_login_only_triggers_auto_login_before_verification(self):
+        plugin = self.make_plugin(
+            {
+                "enable_auto_login": True,
+                "qq_account": "123456789",
+            }
+        )
+        order = []
+        offline_snapshot = self.make_snapshot(
+            "offline",
+            login_state="not_logged_in",
+            login_detail="WebUI 检测到当前未登录 QQ。",
+        )
+
+        async def auto_login():
+            order.append("auto_login")
+            return self.module.AutoLoginAttemptResult(
+                submitted=True,
+                detail="已为 QQ 123456789 提交快速登录请求。",
+            )
+
+        async def collect_snapshot():
+            order.append("collect")
+            return self.make_snapshot(
+                "online",
+                login_state="logged_in",
+                login_detail="WebUI 检测到 QQ 已登录: NapCatBot (123456789)。",
+                user_id="123456789",
+                nickname="NapCatBot",
+                endpoint="http://localhost:6099/api/QQLogin/CheckLoginStatus",
+            )
+
+        plugin._auto_login_qq = AsyncMock(side_effect=auto_login)
+        plugin._collect_status_snapshot = AsyncMock(side_effect=collect_snapshot)
+        plugin._emit_snapshot_logs = lambda *args, **kwargs: order.append("emit")
+        plugin._log = lambda *args, **kwargs: None
+
+        with patch.object(
+            self.module.asyncio,
+            "sleep",
+            new=AsyncMock(),
+        ):
+            await plugin._recover_login_only(offline_snapshot)
+
+        self.assertIn("auto_login", order)
+        self.assertIn("collect", order)
+        self.assertLess(order.index("auto_login"), order.index("collect"))
 
     async def test_recover_napcat_skips_repeated_retry_when_auto_login_needs_manual_action(self):
         plugin = self.make_plugin(
@@ -1422,6 +1513,34 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("NapCat 服务", message)
         self.assertIn("QQ 登录", message)
         self.assertIn("NapCatBot (123456789)", message)
+
+    async def test_cmd_status_reports_manual_login_pending_details(self):
+        plugin = self.make_plugin()
+        plugin._check_count = 3
+        plugin._manual_login_pending_until = 9999999999.0
+        plugin._manual_login_pending_reason = "QQ 密码登录需要验证码。"
+        plugin._collect_status_snapshot = AsyncMock(
+            return_value=self.make_snapshot(
+                "offline",
+                login_state="not_logged_in",
+                login_detail="WebUI 检测到当前未登录 QQ。",
+            )
+        )
+
+        with patch.object(
+            self.module.time,
+            "monotonic",
+            return_value=100.0,
+        ):
+            event = DummyEvent()
+            results = []
+            async for item in plugin.cmd_status(event):
+                results.append(item)
+
+        self.assertEqual(len(results), 1)
+        message = results[0]
+        self.assertIn("人工登录等待", message)
+        self.assertIn("QQ 密码登录需要验证码", message)
 
 
 if __name__ == "__main__":

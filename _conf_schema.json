@@ -77,6 +77,27 @@
         },
         "default": []
     },
+    "manual_login_notify_umos": {
+        "description": "登录辅助通知",
+        "type": "list",
+        "hint": "当 QQ 登录需要人工验证或扫码时主动通知；留空则默认复用退出/重新登录通知目标",
+        "items": {
+            "type": "string"
+        },
+        "default": []
+    },
+    "auto_qr_login_fallback": {
+        "description": "启用二维码登录兜底",
+        "type": "bool",
+        "hint": "当密码登录触发验证码/重新登录时，自动尝试获取 NapCat 二维码登录链接",
+        "default": true
+    },
+    "manual_login_cooldown_seconds": {
+        "description": "人工登录冷却时长（秒）",
+        "type": "int",
+        "hint": "需要验证码或扫码时，冷却期内仅轮询登录状态，不重复重启 NapCat",
+        "default": 900
+    },
     "debug": {
         "description": "调试日志",
         "type": "bool",
