@@ -32,6 +32,7 @@ RECOVERY_SERVICE_READY_POLL_SECONDS = 1
 RECOVERY_VERIFY_INTERVAL_SECONDS = 2
 RECOVERY_VERIFY_ATTEMPTS_WITH_AUTO_LOGIN = 8
 RECOVERY_VERIFY_ATTEMPTS_DEFAULT = 4
+RECOVERY_CONFLICT_RESTART_LIMIT = 1
 QR_LOGIN_VALID_SECONDS = 120
 MANUAL_LOGIN_COOLDOWN_SECONDS_DEFAULT = 120
 STATUS_TEXT = {
@@ -684,6 +685,15 @@ class NapcatKeeperPlugin(Star):
         snapshot: StatusSnapshot,
         current_time: str,
     ) -> bool:
+        if self._snapshot_requires_napcat_restart(snapshot):
+            self._log(
+                f"[{current_time}] 二维码登录等待期内检测到 `QQ Is Logined` / 重复登录冲突，"
+                "结束等待模式并立即执行 NapCat 全量恢复。",
+                "WARNING",
+            )
+            self._clear_manual_login_pending()
+            return False
+
         if not self._should_hold_manual_login_pending(snapshot):
             return False
 
@@ -2340,7 +2350,11 @@ class NapcatKeeperPlugin(Star):
         except Exception as e:
             self._log(f"QQ 重新登录流程失败: {e}", "ERROR", exc_info=True)
 
-    async def _recover_napcat(self):
+    async def _recover_napcat(
+        self,
+        *,
+        conflict_retry_count: int = 0,
+    ):
         """恢复 NapCat。"""
         self._last_restart_time = datetime.now()
         self._webui_credential = None
@@ -2397,11 +2411,24 @@ class NapcatKeeperPlugin(Star):
             if self.enable_auto_login:
                 auto_login_result = await self._auto_login_qq()
                 if auto_login_result.restart_napcat_required:
+                    if conflict_retry_count < RECOVERY_CONFLICT_RESTART_LIMIT:
+                        next_retry_count = conflict_retry_count + 1
+                        self._log(
+                            "[5/6] QQ 登录处理仍命中 `QQ Is Logined` / 重复登录冲突，"
+                            "立即重新执行 NapCat 全量恢复。"
+                            f" | 第 {next_retry_count}/{RECOVERY_CONFLICT_RESTART_LIMIT} 次冲突重启"
+                            f" | 原因: {auto_login_result.detail}",
+                            "WARNING",
+                        )
+                        await self._recover_napcat(
+                            conflict_retry_count=next_retry_count,
+                        )
+                        return
                     self._log(
-                        "[5/6] QQ 登录处理仍命中 `QQ Is Logined` / 重复登录冲突。"
-                        " 当前流程已经是 NapCat 全量恢复，本轮继续校验恢复结果。"
+                        "[5/6] QQ 登录处理仍命中 `QQ Is Logined` / 重复登录冲突，"
+                        "但已达到本轮冲突重启上限，将继续输出当前恢复结果。"
                         f" | 原因: {auto_login_result.detail}",
-                        "WARNING",
+                        "ERROR",
                     )
                 elif auto_login_result.manual_action_required:
                     self._log(

@@ -1556,6 +1556,63 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         sleep_calls = [call.args[0] for call in sleep_mock.await_args_list]
         self.assertIn(2, sleep_calls)
 
+    async def test_recover_napcat_retries_full_recovery_when_auto_login_requires_restart(self):
+        plugin = self.make_plugin(
+            {
+                "enable_auto_login": True,
+                "qq_account": "123456789",
+                "qq_password": "pass123",
+            }
+        )
+        online_snapshot = self.make_snapshot(
+            "online",
+            login_state="logged_in",
+            login_detail="WebUI 检测到 QQ 已登录: NapCatBot (123456789)。",
+            user_id="123456789",
+            nickname="NapCatBot",
+            endpoint="http://localhost:6099/api/QQLogin/CheckLoginStatus",
+        )
+
+        plugin._clear_login_state = AsyncMock()
+        plugin._start_napcat = AsyncMock()
+        plugin._wait_for_napcat_service_ready = AsyncMock(
+            return_value=self.module.ServiceCheckResult(
+                state="online",
+                checked_url="http://localhost:6099",
+                status_code=301,
+                detail="HTTP 301，NapCat 服务可达。",
+            )
+        )
+        plugin._auto_login_qq = AsyncMock(
+            side_effect=[
+                self.module.AutoLoginAttemptResult(
+                    submitted=False,
+                    detail="QQ 账号密码登录命中 `QQ Is Logined` / 重复登录冲突，需要直接重启 NapCat 后再继续恢复。",
+                    level="WARNING",
+                    restart_napcat_required=True,
+                ),
+                self.module.AutoLoginAttemptResult(
+                    submitted=True,
+                    detail="QQ 账号密码登录已提交。 | 结果: 已为 QQ 123456789 提交账号密码登录请求。",
+                ),
+            ]
+        )
+        plugin._collect_status_snapshot = AsyncMock(return_value=online_snapshot)
+        plugin._emit_snapshot_logs = lambda *args, **kwargs: None
+        plugin._log = lambda *args, **kwargs: None
+
+        with patch.object(self.module.subprocess, "run"), patch.object(
+            self.module.asyncio,
+            "sleep",
+            new=AsyncMock(),
+        ):
+            await plugin._recover_napcat()
+
+        self.assertEqual(plugin._auto_login_qq.await_count, 2)
+        self.assertEqual(plugin._clear_login_state.await_count, 2)
+        self.assertEqual(plugin._start_napcat.await_count, 2)
+        self.assertEqual(plugin._collect_status_snapshot.await_count, 1)
+
     async def test_cmd_status_reports_service_and_login_details(self):
         plugin = self.make_plugin()
         plugin._check_count = 12
@@ -1693,6 +1750,38 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
             plugin._recover_login_only.await_args.kwargs,
             {"keep_manual_pending": True},
         )
+
+    async def test_handle_manual_login_pending_snapshot_clears_wait_mode_on_conflict(self):
+        plugin = self.make_plugin(
+            {
+                "enable_auto_login": True,
+                "qq_account": "123456789",
+            }
+        )
+        snapshot = self.make_snapshot(
+            "offline",
+            login_state="not_logged_in",
+            login_detail="WebUI 检测到当前未登录 QQ: QQ Is Logined",
+        )
+        plugin._manual_login_pending_until = 200.0
+        plugin._manual_login_pending_reason = "NapCat 当前未登录，需要扫码完成 QQ 登录。"
+        plugin._manual_login_pending_context = {
+            "account": "123456789",
+            "qrcode_url": "https://example.com/original-qr",
+            "qrcode_expires_at": 180.0,
+        }
+        plugin._recover_login_only = AsyncMock()
+        plugin._log = lambda *args, **kwargs: None
+
+        with patch.object(self.module.time, "monotonic", return_value=110.0):
+            handled = await plugin._handle_manual_login_pending_snapshot(
+                snapshot,
+                "2026-03-25 12:00:00",
+            )
+
+        self.assertFalse(handled)
+        self.assertEqual(plugin._recover_login_only.await_count, 0)
+        self.assertFalse(plugin._is_manual_login_pending())
 
     async def test_prepare_manual_login_assistance_reuses_cached_qr_before_timeout(self):
         plugin = self.make_plugin()
