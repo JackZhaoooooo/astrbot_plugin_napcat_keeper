@@ -8,10 +8,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
@@ -25,8 +26,10 @@ DEFAULT_NAPCAT_URL = "http://localhost:6099"
 DEFAULT_CHECK_INTERVAL = 30
 DEFAULT_REQUEST_TIMEOUT = 10
 DEFAULT_WEBUI_CONFIG_PATH = "/root/AstrBot/napcat/config/webui.json"
+DEFAULT_NOTIFY_RETRY_COOLDOWN_SECONDS = 30
 MIN_CHECK_INTERVAL = 5
 MIN_REQUEST_TIMEOUT = 3
+MIN_NOTIFY_RETRY_COOLDOWN_SECONDS = 5
 
 STATE_TEXT = {
     "logged_in": "🟢 已登录",
@@ -45,6 +48,8 @@ class LoginState:
 
 
 class NapcatKeeperPlugin(Star):
+    _active_monitor_instance: ClassVar["NapcatKeeperPlugin | None"] = None
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.context = context
@@ -67,6 +72,17 @@ class NapcatKeeperPlugin(Star):
             default=DEFAULT_REQUEST_TIMEOUT,
             minimum=MIN_REQUEST_TIMEOUT,
         )
+        self.notify_on_initial_logged_out = self._parse_bool(
+            config.get("notify_on_initial_logged_out", True)
+        )
+        self.notify_retry_cooldown_seconds = self._parse_int(
+            config.get(
+                "notify_retry_cooldown_seconds",
+                DEFAULT_NOTIFY_RETRY_COOLDOWN_SECONDS,
+            ),
+            default=DEFAULT_NOTIFY_RETRY_COOLDOWN_SECONDS,
+            minimum=MIN_NOTIFY_RETRY_COOLDOWN_SECONDS,
+        )
         self.notify_umos = self._normalize_umo_list(config.get("notify_umos", []))
         self.debug = self._parse_bool(config.get("debug", False))
         self._resolved_napcat_token = self._resolve_napcat_token()
@@ -76,34 +92,67 @@ class NapcatKeeperPlugin(Star):
         self._last_state: LoginState | None = None
         self._check_lock = asyncio.Lock()
         self._webui_credential: str | None = None
+        self._logout_notification_sent = False
+        self._last_notify_attempt_at = 0.0
+        self._instance_label = hex(id(self))
 
     async def initialize(self):
+        old = NapcatKeeperPlugin._active_monitor_instance
+        if old is not None and old is not self:
+            await old._stop_monitor_task(
+                reason=f"被新实例接管: {self._instance_label}",
+            )
+
+        if self._monitor_task and not self._monitor_task.done():
+            self._log(
+                f"监控任务已存在，跳过重复初始化 | 实例: {self._instance_label}",
+                level="WARNING",
+            )
+            NapcatKeeperPlugin._active_monitor_instance = self
+            return
+
         await self._ensure_session()
         self._monitor_task = asyncio.create_task(self._monitor_loop())
+        NapcatKeeperPlugin._active_monitor_instance = self
         self._log(
             "插件已启动"
             f" | 监控地址: {self.napcat_url}"
             f" | 检查间隔: {self.check_interval} 秒"
             f" | 通知目标: {len(self.notify_umos)}"
             f" | WebUI Token: {'已就绪' if self._resolved_napcat_token else '未配置'}"
+            f" | 实例: {self._instance_label}"
         )
 
     async def terminate(self):
-        if self._monitor_task and not self._monitor_task.done():
-            self._monitor_task.cancel()
-            try:
-                await self._monitor_task
-            except asyncio.CancelledError:
-                pass
+        await self._stop_monitor_task(reason="插件终止")
+
+        if NapcatKeeperPlugin._active_monitor_instance is self:
+            NapcatKeeperPlugin._active_monitor_instance = None
 
         if self._session and not self._session.closed:
             await self._session.close()
 
         self._log("插件已停止")
 
+    async def _stop_monitor_task(self, reason: str):
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._log(f"监控任务已停止 | 原因: {reason} | 实例: {self._instance_label}")
+        self._monitor_task = None
+
     async def _monitor_loop(self):
         while True:
             try:
+                if NapcatKeeperPlugin._active_monitor_instance is not self:
+                    self._log(
+                        f"检测到监控实例已切换，停止当前循环 | 实例: {self._instance_label}",
+                        level="WARNING",
+                    )
+                    return
                 await self.check_once()
             except asyncio.CancelledError:
                 raise
@@ -124,18 +173,59 @@ class NapcatKeeperPlugin(Star):
         if self._should_log_state(previous, state):
             self._log_state(state)
 
-        if (
-            previous
-            and previous.state == "logged_in"
-            and state.state == "logged_out"
-        ):
-            await self._send_logout_notifications(state)
-
         if previous and previous.state != "logged_in" and state.state == "logged_in":
+            self._logout_notification_sent = False
             self._log(
                 f"NapCat 登录状态已恢复 | 账号: {self._format_account(state)}",
                 level="INFO",
             )
+
+        if self._should_attempt_logout_notification(previous, state):
+            self._last_notify_attempt_at = time.monotonic()
+            delivered = await self._send_logout_notifications(state)
+            if delivered:
+                self._logout_notification_sent = True
+
+    def _should_attempt_logout_notification(
+        self,
+        previous: LoginState | None,
+        current: LoginState,
+    ) -> bool:
+        if not self._is_logout_like_state(current):
+            if current.state == "logged_in":
+                self._logout_notification_sent = False
+            return False
+
+        if self._logout_notification_sent:
+            return False
+
+        if previous and previous.state == "logged_in":
+            return True
+
+        if previous is None:
+            return self.notify_on_initial_logged_out
+
+        # 离线期间若首次通知发送失败，按冷却周期重试
+        elapsed = time.monotonic() - self._last_notify_attempt_at
+        return elapsed >= float(self.notify_retry_cooldown_seconds)
+
+    @staticmethod
+    def _is_logout_like_state(state: LoginState) -> bool:
+        if state.state == "logged_out":
+            return True
+        if state.state != "error":
+            return False
+        text = state.detail.lower()
+        keywords = [
+            "未登录",
+            "kickedoffline",
+            "下线",
+            "logout",
+            "log out",
+            "islogin",
+            "login",
+        ]
+        return any(keyword in text for keyword in keywords)
 
     async def _fetch_login_state(self) -> LoginState:
         errors: list[str] = []
@@ -563,14 +653,28 @@ class NapcatKeeperPlugin(Star):
                 return normalized
         return None
 
-    async def _send_logout_notifications(self, state: LoginState):
+    async def _send_logout_notifications(self, state: LoginState) -> bool:
         if not self.notify_umos:
             self._log("检测到退出登录，但未配置通知 UMO。", level="WARNING")
-            return
+            return False
 
         message = self._build_logout_message(state)
+        success_count = 0
 
         for umo in self.notify_umos:
+            can_send, reason = self._precheck_umo_deliverability(umo)
+            if not can_send:
+                self._log(
+                    f"退出登录通知发送未确认成功 | UMO: {umo} | 原因: {reason}",
+                    level="WARNING",
+                )
+                continue
+            if reason:
+                self._log(
+                    f"退出登录通知发送前处理 | UMO: {umo} | 信息: {reason}",
+                    level="INFO",
+                )
+
             chain = MessageChain().message(message)
             try:
                 delivered = await self.context.send_message(umo, chain)
@@ -584,11 +688,80 @@ class NapcatKeeperPlugin(Star):
 
             if delivered:
                 self._log(f"退出登录通知发送成功 | UMO: {umo}", level="INFO")
+                success_count += 1
             else:
                 self._log(
                     f"退出登录通知发送失败 | UMO: {umo} | 原因: 未找到匹配平台",
                     level="WARNING",
                 )
+
+        if success_count == 0:
+            self._log("退出登录通知未通过任何 UMO 发送成功。", level="WARNING")
+
+        return success_count > 0
+
+    def _precheck_umo_deliverability(self, umo: str) -> tuple[bool, str | None]:
+        platform_name, _message_type, session_id = self._parse_umo(umo)
+        if not platform_name or not session_id:
+            return True, None
+
+        platform_manager = getattr(self.context, "platform_manager", None)
+        platform_insts = getattr(platform_manager, "platform_insts", None)
+        if not isinstance(platform_insts, list):
+            return True, None
+
+        for platform in platform_insts:
+            meta = None
+            meta_func = getattr(platform, "meta", None)
+            if callable(meta_func):
+                try:
+                    meta = meta_func()
+                except Exception:
+                    meta = None
+            if getattr(meta, "id", None) != platform_name:
+                continue
+
+            inbound_cache = getattr(platform, "_session_last_inbound_message_id", None)
+            if isinstance(inbound_cache, dict) and session_id not in inbound_cache:
+                outbound_cache = getattr(
+                    platform,
+                    "_session_last_outbound_message_id",
+                    None,
+                )
+                outbound_msg_id = None
+                if isinstance(outbound_cache, dict):
+                    outbound_msg_id = outbound_cache.get(session_id)
+                remember_inbound = getattr(
+                    platform,
+                    "remember_session_inbound_message_id",
+                    None,
+                )
+                if outbound_msg_id and callable(remember_inbound):
+                    try:
+                        remember_inbound(session_id, outbound_msg_id)
+                        return (
+                            True,
+                            f"已使用最近出站 msg_id 作为临时锚点: {outbound_msg_id}",
+                        )
+                    except Exception:
+                        pass
+                return (
+                    False,
+                    "当前会话没有可用的入站 msg_id，QQ 官方平台无法主动发送。",
+                )
+            return True, None
+
+        return True, None
+
+    @staticmethod
+    def _parse_umo(umo: str) -> tuple[str | None, str | None, str | None]:
+        text = (umo or "").strip()
+        if not text:
+            return None, None, None
+        parts = text.split(":", 2)
+        if len(parts) != 3:
+            return None, None, None
+        return parts[0], parts[1], parts[2]
 
     def _build_logout_message(self, state: LoginState) -> str:
         account_text = self._format_account(state)

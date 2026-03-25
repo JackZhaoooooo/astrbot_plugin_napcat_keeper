@@ -29,6 +29,18 @@
         "hint": "最小 3 秒，默认 10 秒",
         "default": 10
     },
+    "notify_on_initial_logged_out": {
+        "description": "启动时若已离线是否通知",
+        "type": "bool",
+        "hint": "开启后：插件启动后首次检测到未登录也会推送一次通知",
+        "default": true
+    },
+    "notify_retry_cooldown_seconds": {
+        "description": "离线通知失败重试间隔（秒）",
+        "type": "int",
+        "hint": "通知发送失败时会按该间隔重试，最小 5 秒，默认 30 秒",
+        "default": 30
+    },
     "notify_umos": {
         "description": "退出登录通知 UMO 列表",
         "type": "list",

@@ -14,6 +14,7 @@
 - 如果 WebUI 鉴权或接口检测失败，会再回退到 onebot `get_login_info` 系列接口
 - 对 `Unauthorized`、`token is empty` 这类鉴权失败响应不再误判成“未登录”
 - 只有在状态从“已登录”切到“未登录”时才发送一次通知，避免轮询刷屏
+- 支持“启动时已离线通知一次”和“通知失败冷却重试”
 - 支持命令 `/napcat_status` 手动查看当前状态
 
 ## 配置项
@@ -25,6 +26,8 @@
 | `webui_config_path` | `/root/AstrBot/napcat/config/webui.json` | 本地 WebUI 配置路径，仅在未填写 `napcat_token` 时使用 |
 | `check_interval` | `30` | 轮询间隔，单位秒 |
 | `request_timeout_seconds` | `10` | 单次请求超时秒数 |
+| `notify_on_initial_logged_out` | `true` | 插件启动后首次检测到已离线时也发送一次通知 |
+| `notify_retry_cooldown_seconds` | `30` | 离线通知发送失败后的重试间隔（秒） |
 | `notify_umos` | `[]` | 退出登录通知目标 UMO 列表 |
 | `debug` | `false` | 开启后输出每次轮询日志 |
 
@@ -46,5 +49,6 @@
 
 - `notify_umos` 需要填写 AstrBot 能主动发送的有效会话
 - 某些平台的私聊主动发送能力受平台限制，如果发送失败，插件会把失败原因写到日志
+- 对 `qq_official` 平台，若会话没有可用入站 `msg_id`，AstrBot 无法主动发私聊；插件会在日志中明确提示该原因
 - 如果你的 NapCat 走了反向代理前缀，比如 `https://example.com/napcat`，直接把这个地址填到 `napcat_url` 即可
 - 如果 NapCat 与插件在同一台机器，且 `webui.json` 在默认位置，插件会自动读取本地 token

@@ -287,6 +287,87 @@ class NapcatKeeperPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.user_id, "987654321")
         self.assertEqual(result.nickname, "FallbackBot")
 
+    async def test_initial_logged_out_triggers_notification_when_enabled(self):
+        context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))
+        plugin = self.make_plugin(
+            {
+                "notify_umos": ["umo-1"],
+                "notify_on_initial_logged_out": True,
+            },
+            context=context,
+        )
+        plugin._fetch_login_state = AsyncMock(
+            return_value=self.make_state("logged_out", detail="初始即掉线")
+        )
+
+        await plugin.check_once()
+
+        self.assertEqual(context.send_message.await_count, 1)
+
+    async def test_initial_logged_out_no_notification_when_disabled(self):
+        context = types.SimpleNamespace(send_message=AsyncMock(return_value=True))
+        plugin = self.make_plugin(
+            {
+                "notify_umos": ["umo-1"],
+                "notify_on_initial_logged_out": False,
+            },
+            context=context,
+        )
+        plugin._fetch_login_state = AsyncMock(
+            return_value=self.make_state("logged_out", detail="初始即掉线")
+        )
+
+        await plugin.check_once()
+
+        self.assertEqual(context.send_message.await_count, 0)
+
+    async def test_precheck_qq_official_msg_id_missing_blocks_send(self):
+        context = types.SimpleNamespace(
+            send_message=AsyncMock(return_value=True),
+            platform_manager=types.SimpleNamespace(
+                platform_insts=[
+                    types.SimpleNamespace(
+                        meta=lambda: types.SimpleNamespace(id="default"),
+                        _session_last_inbound_message_id={},
+                    )
+                ]
+            ),
+        )
+        plugin = self.make_plugin(
+            {"notify_umos": ["default:FriendMessage:session-1"]},
+            context=context,
+        )
+
+        delivered = await plugin._send_logout_notifications(
+            self.make_state("logged_out", detail="测试")
+        )
+
+        self.assertFalse(delivered)
+        self.assertEqual(context.send_message.await_count, 0)
+
+    async def test_precheck_uses_outbound_anchor_when_available(self):
+        platform = types.SimpleNamespace(
+            meta=lambda: types.SimpleNamespace(id="default"),
+            _session_last_inbound_message_id={},
+            _session_last_outbound_message_id={"session-1": "outbound-abc"},
+            remember_session_inbound_message_id=lambda *_args: None,
+        )
+        context = types.SimpleNamespace(
+            send_message=AsyncMock(return_value=True),
+            platform_manager=types.SimpleNamespace(platform_insts=[platform]),
+        )
+        plugin = self.make_plugin(
+            {"notify_umos": ["default:FriendMessage:session-1"]},
+            context=context,
+        )
+
+        delivered = await plugin._send_logout_notifications(
+            self.make_state("logged_out", detail="测试")
+        )
+
+        self.assertTrue(delivered)
+        self.assertEqual(context.send_message.await_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
